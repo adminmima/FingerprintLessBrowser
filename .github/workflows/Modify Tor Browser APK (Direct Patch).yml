@@ -1,57 +1,132 @@
-name: Modify Tor Browser APK (Direct Patch)
+name: Patch Tor Browser APK (Auto)
 
 on:
   workflow_dispatch:
+    inputs:
+      tor_version:
+        description: 'Tor Browser version (e.g. 16.0a13 or 15.0.23)'
+        required: true
+        default: '16.0a13'
+      channel:
+        description: 'stable or alpha'
+        required: true
+        default: 'alpha'
 
 jobs:
-  patch-apk:
+  patch:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - name: Download Tor Browser APK
-        run: |
-          # 从官方或镜像下载，约60-80MB
-          wget -O tor.apk "https://your-mirror/tor-browser.apk"
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - name: Setup minimal tools
+      - name: Install minimal tools
         run: |
-          sudo apt-get install -y --no-install-recommends unzip zip openjdk-17-jre-headless
-          wget -O apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
-          wget -O uber-apk-signer.jar https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip zip wget openjdk-17-jre-headless jq
+          wget -q -O apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+          wget -q -O signer.jar https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar
 
-      - name: Unpack APK with apktool
-        run: java -jar apktool.jar d tor.apk -o tor_out -s  # -s 跳过dex反编译，更快更小
-
-      - name: Patch omni.ja preferences
+      - name: Download 64-bit APK
         run: |
-          cd tor_out/assets
+          V="${{ github.event.inputs.tor_version }}"
+          BASE="https://dist.torproject.org/torbrowser/${V}"
+          FILE="tor-browser-android-aarch64-${V}.apk"
+          echo "Downloading ${BASE}/${FILE}"
+          wget -q --show-progress -O tor-orig.apk "${BASE}/${FILE}"
+          ls -lh tor-orig.apk
+
+      - name: Inspect APK structure
+        id: inspect
+        run: |
+          unzip -l tor-orig.apk > apk_list.txt
+          echo "=== Looking for omni.ja ==="
+          grep -i "omni.ja" apk_list.txt || echo "NO_OMNI"
+          echo "=== Looking for torrc ==="
+          grep -i "torrc" apk_list.txt || echo "NO_TORRC"
+          echo "=== Looking for prefs ==="
+          grep -iE "prefs|defaults/pref" apk_list.txt || echo "NO_PREFS"
+          echo "=== assets/ contents ==="
+          grep "assets/" apk_list.txt | head -40
+          # 自动判断走哪条路径
+          if grep -qi "assets/omni.ja" apk_list.txt; then
+            echo "route=omni" >> $GITHUB_OUTPUT
+          elif grep -qi "assets/torrc" apk_list.txt; then
+            echo "route=torrc" >> $GITHUB_OUTPUT
+          else
+            echo "route=dex" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Route A - Patch omni.ja prefs
+        if: steps.inspect.outputs.route == 'omni'
+        run: |
+          mkdir -p work && cd work
+          unzip -q ../tor-orig.apk "assets/omni.ja"
+          cd assets
           mkdir omni_extract && cd omni_extract
-          unzip -o ../omni.ja
-          
-          # 找到包含 torlauncher.start_tor 的pref文件
-          PREF_FILE=$(grep -rl "torlauncher.start_tor" defaults/ 2>/dev/null | head -1)
-          echo "Patching: $PREF_FILE"
-          
-          # 改两个值
-          sed -i 's/extensions\.torlauncher\.start_tor.*true/extensions.torlauncher.start_tor", false/' "$PREF_FILE"
-          sed -i 's/network\.proxy\.type.*1/network.proxy.type", 0/' "$PREF_FILE"
-          
-          # 如果pref文件里没有network.proxy.type，追加
-          grep -q "network.proxy.type" "$PREF_FILE" || echo 'pref("network.proxy.type", 0);' >> "$PREF_FILE"
-          
-          # 重新打包omni.ja（保持zip格式，不压缩某些文件）
-          zip -r -0 ../omni_new.ja ./*
+          unzip -q ../omni.ja
+          echo "=== prefs files found ==="
+          find . -name "*.js" -path "*pref*" | head -20
+          # 搜索并修改关键pref
+          grep -rl "torlauncher.start_tor" . 2>/dev/null | while read f; do
+            echo "Patching $f"
+            sed -i 's/extensions\.torlauncher\.start_tor.*true/extensions.torlauncher.start_tor", false/' "$f"
+          done
+          grep -rl "network.proxy.type" . 2>/dev/null | while read f; do
+            echo "Patching $f"
+            sed -i 's/network\.proxy\.type.*1/network.proxy.type", 0/' "$f"
+          done
+          # 如果没找到，追加到 prefs.js
+          if ! grep -rq "torlauncher.start_tor" .; then
+            echo 'pref("extensions.torlauncher.start_tor", false);' >> prefs.js 2>/dev/null || true
+          fi
+          if ! grep -rq "network.proxy.type" .; then
+            echo 'pref("network.proxy.type", 0);' >> prefs.js 2>/dev/null || true
+          fi
+          # 重新打包 omni.ja
+          zip -q -r -0 ../omni_new.ja ./*
           mv ../omni_new.ja ../omni.ja
+          cd ../..
+          # 更新 APK
+          cd work
+          zip -q -0 ../tor-orig.apk assets/omni.ja
+          cd ..
 
-      - name: Repack APK
-        run: java -jar apktool.jar b tor_out -o tor_modified_unsigned.apk
-
-      - name: Sign APK
+      - name: Route B - Patch torrc
+        if: steps.inspect.outputs.route == 'torrc'
         run: |
-          java -jar uber-apk-signer.jar --apks tor_modified_unsigned.apk
-          # 产物：tor_modified_unsigned-aligned-signed.apk
+          mkdir -p work && cd work
+          unzip -q ../tor-orig.apk "assets/torrc"
+          # 禁用 Tor 启动
+          sed -i 's/^/# /' assets/torrc
+          echo "# Tor disabled by FingerprintLessBrowser" >> assets/torrc
+          zip -q -0 ../tor-orig.apk assets/torrc
 
-      - name: Upload
+      - name: Route C - Full dex decompile (fallback)
+        if: steps.inspect.outputs.route == 'dex'
+        run: |
+          java -jar apktool.jar d tor-orig.apk -o tor_out
+          echo "=== Searching for Tor service references ==="
+          grep -rln "TorService\|startTor\|start_tor" tor_out/smali* 2>/dev/null | head -20
+          echo "=== This route needs manual review of smali files above ==="
+
+      - name: Re-sign APK
+        if: steps.inspect.outputs.route != 'dex'
+        run: |
+          java -jar signer.jar --apks tor-orig.apk --allowResign -o signed_output
+          ls -lh signed_output/
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FingerprintLessBrowser
-          path: tor_modified_unsigned-aligned-signed.apk
+          name: FingerprintLess-${{ github.event.inputs.channel }}-${{ github.event.inputs.tor_version }}
+          path: |
+            signed_output/*.apk
+            apk_list.txt
+          if-no-files-found: warn
+
+      - name: Print inspect summary
+        if: always()
+        run: |
+          echo "Route chosen: ${{ steps.inspect.outputs.route }}"
+          echo "If route=dex, check the apk_list.txt artifact and grep output above"
