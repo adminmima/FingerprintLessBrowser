@@ -1,1 +1,68 @@
-（上面完整内容）
+name: Inspect TorLauncher JS and DEX
+
+on:
+  workflow_dispatch:
+    inputs:
+      tor_version:
+        required: true
+        default: '16.0a13'
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip zip wget xz-utils openjdk-17-jre-headless
+          wget -q -O apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+
+      - name: Download APK
+        run: |
+          V="${{ inputs.tor_version }}"
+          URL="https://dist.torproject.org/torbrowser/${V}/tor-browser-android-aarch64-${V}.apk"
+          wget -q -O tor.apk "$URL"
+          ls -lh tor.apk
+
+      - name: Extract omni.ja and list TorLauncher files
+        run: |
+          mkdir -p work && cd work
+          unzip -q ../tor.apk assets/omni.ja.xz
+          cp assets/omni.ja.xz omni.ja.xz
+          xz -d omni.ja.xz
+          mkdir omni && cd omni
+          unzip -q ../omni.ja
+
+          echo "========== chrome/ top level =========="
+          ls chrome/ 2>/dev/null | head -40
+
+          echo "========== torbutton/torlauncher related files =========="
+          find . -type d \( -iname "*tor*" -o -iname "*launcher*" \) 2>/dev/null | head -30
+          find . -type f -iname "*tor*" 2>/dev/null | head -50
+
+          echo "========== grep for bootstrap/connect stage =========="
+          grep -rln "bootstrap\|TorConnectStage\|connectStage\|torlauncher" chrome/ defaults/ 2>/dev/null | head -30
+
+          echo "========== defaults/pref contents =========="
+          ls defaults/pref/ 2>/dev/null
+          echo "---"
+          grep -riE "tor|proxy" defaults/pref/ 2>/dev/null | head -40
+
+      - name: Decompile dex
+        run: |
+          cd $GITHUB_WORKSPACE
+          java -jar apktool.jar d tor.apk -o dex_out -f
+          echo "========== Java/Kotlin Tor classes =========="
+          find dex_out/smali* -type f -iname "*Tor*.smali" 2>/dev/null | head -40
+          find dex_out/smali* -type f -iname "*Orbot*.smali" 2>/dev/null | head -20
+          find dex_out/smali* -type f -iname "*Proxy*.smali" 2>/dev/null | head -20
+
+          echo "========== grep for start_tor / startTor =========="
+          grep -rln "start_tor\|startTor\|TorService" dex_out/smali* 2>/dev/null | head -30
