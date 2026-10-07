@@ -4,14 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       tor_version:
-        description: 'Tor Browser version'
         required: true
         default: '16.0a13'
+
+permissions:
+  contents: write
 
 jobs:
   patch:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -19,45 +21,30 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq unzip zip wget xz-utils openjdk-17-jre-headless
-          wget -q -O uber-apk-signer.jar \
-            https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar
+          wget -q -O apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+          wget -q -O uber-apk-signer.jar https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar
 
       - name: Download APK
         run: |
           V="${{ inputs.tor_version }}"
-          URL="https://dist.torproject.org/torbrowser/${V}/tor-browser-android-aarch64-${V}.apk"
-          echo "Downloading $URL"
-          wget -q --show-progress -O tor-orig.apk "$URL"
+          wget -q -O tor-orig.apk "https://dist.torproject.org/torbrowser/${V}/tor-browser-android-aarch64-${V}.apk"
           ls -lh tor-orig.apk
 
+      # ============ Patch 1: omni.ja prefs ============
       - name: Extract omni.ja.xz
         run: |
           mkdir -p staging && cd staging
           unzip -o ../tor-orig.apk assets/omni.ja.xz assets/omni.ja.sha256
-          ls -lh assets/
-          echo "=== sha256 file format ==="
-          cat assets/omni.ja.sha256
-          echo ""
 
-      - name: Decompress omni.ja and inspect prefs
+      - name: Patch omni.ja prefs
         run: |
           cd staging
           cp assets/omni.ja.xz omni.ja.xz
           xz -d omni.ja.xz
-          ls -lh omni.ja
           mkdir omni_content && cd omni_content
           unzip -q ../omni.ja
-          echo "=== defaults/pref/ ==="
-          ls -la defaults/pref/ 2>/dev/null || echo "no defaults/pref dir"
-          echo "=== 现有 pref 文件 ==="
-          find . -name "*.js" -path "*pref*" 2>/dev/null | head -30
-
-      - name: Add our prefs file
-        run: |
-          cd staging/omni_content
           mkdir -p defaults/pref
-          cat > defaults/pref/zzz-fingerprintless.js << 'EOF'
-          // FingerprintLessBrowser - 移除 Tor 网络，保留反指纹
+          cat > defaults/pref/zzz-fingerprintless.js << 'PREFEOF'
           pref("network.proxy.type", 0);
           pref("network.proxy.socks", "");
           pref("network.proxy.socks_port", 0);
@@ -66,47 +53,78 @@ jobs:
           pref("extensions.torlauncher.quickstart", false);
           pref("extensions.torlauncher.prompt_at_startup", false);
           pref("extensions.torbutton.startup", false);
-          EOF
-          ls -la defaults/pref/
-
-      - name: Repack omni.ja and update sha256
-        run: |
-          cd staging/omni_content
+          PREFEOF
           zip -q -r -0 ../omni-new.ja ./*
           cd ..
           xz -9 -k -f omni-new.ja
-          ls -lh omni-new.ja.xz
-
           NEW_SHA=$(sha256sum omni-new.ja.xz | awk '{print $1}')
-          echo "New SHA256: $NEW_SHA"
-
-          # 匹配原 sha256 文件格式
-          ORIG=$(cat assets/omni.ja.sha256)
-          if echo "$ORIG" | grep -qE "^[a-f0-9]{64}[[:space:]]"; then
-            echo "$NEW_SHA  omni.ja.xz" > assets/omni.ja.sha256
-          else
-            echo "$NEW_SHA" > assets/omni.ja.sha256
-          fi
+          echo "$NEW_SHA" > assets/omni.ja.sha256
           cp omni-new.ja.xz assets/omni.ja.xz
-          echo "=== 新 sha256 ==="
-          cat assets/omni.ja.sha256
 
-      - name: Replace files in APK
+      # ============ Patch 2: smali 绕过引导页 ============
+      - name: Decompile APK with apktool
         run: |
+          java -jar apktool.jar d tor-orig.apk -o decoded -f
+          ls decoded/smali_classes2/org/mozilla/fenix/tor/ | head -20
+
+      - name: Patch TorConnectionAssistViewModel smali
+        run: |
+          TARGET=decoded/smali_classes2/org/mozilla/fenix/tor/TorConnectionAssistViewModel\$collectTorConnectStage\$2.smali
+          echo "=== Before ==="
+          grep -A 14 ":pswitch_data_0" "$TARGET"
+          
+          # 在 packed-switch 段内，把第8个 :pswitch_6 改为 :pswitch_1
+          # 用 awk 精确控制在 .packed-switch 到 .end packed-switch 之间替换
+          awk '
+            /\.packed-switch/ { in_switch=1; print; next }
+            /\.end packed-switch/ { in_switch=0; print; next }
+            in_switch && /^[[:space:]]*:pswitch_6[[:space:]]*$/ {
+              # 保留缩进
+              match($0, /^[[:space:]]*/)
+              indent = substr($0, 1, RLENGTH)
+              print indent ":pswitch_1"
+              next
+            }
+            { print }
+          ' "$TARGET" > "${TARGET}.new"
+          mv "${TARGET}.new" "$TARGET"
+          
+          echo ""
+          echo "=== After ==="
+          grep -A 14 ":pswitch_data_0" "$TARGET"
+
+      - name: Repack APK
+        run: |
+          java -jar apktool.jar b decoded -o tor-patched-unsigned.apk
+          ls -lh tor-patched-unsigned.apk
+
+      # ============ 合并 Patch 1 到新 APK ============
+      - name: Apply omni.ja changes to patched APK
+        run: |
+          # 从 staging 里拷贝我们改过的 omni.ja.xz 到新 APK
           cd staging
-          zip -0 ../tor-orig.apk assets/omni.ja.xz assets/omni.ja.sha256
+          cp ../tor-patched-unsigned.apk ./tor-patched.apk
+          # 用 zip 更新 APK 里的两个文件
+          zip -0 tor-patched.apk assets/omni.ja.xz assets/omni.ja.sha256
+          mv tor-patched.apk ../
           cd ..
-          echo "=== 验证 ==="
-          unzip -l tor-orig.apk | grep omni
-          ls -lh tor-orig.apk
+          ls -lh tor-patched.apk
 
       - name: Sign APK
         run: |
-          java -jar uber-apk-signer.jar --apks tor-orig.apk -o signed --allowResign
+          java -jar uber-apk-signer.jar --apks tor-patched.apk -o signed --allowResign
           ls -lh signed/
 
-      - name: Upload
-        uses: actions/upload-artifact@v4
-        with:
-          name: FingerprintLess-${{ inputs.tor_version }}
-          path: signed/*.apk
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V="${{ inputs.tor_version }}"
+          TAG="v${V}-fingerprintless"
+          gh release create "$TAG" \
+            --repo ${{ github.repository }} \
+            --title "FingerprintLess ${V}" \
+            --notes "基于 Tor Browser ${V}（arm64-v8a）。已移除 Tor 网络，直连互联网，完整保留反指纹保护（Canvas / WebGL / 时区 / 字体 / 窗口尺寸等）。" \
+            signed/*.apk \
+            || gh release upload "$TAG" signed/*.apk --clobber --repo ${{ github.repository }}
+          echo "Release: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
