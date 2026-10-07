@@ -40,33 +40,23 @@ jobs:
       - name: Decompile
         run: java -jar apktool.jar d tor-orig.apk -o decoded -f
 
-      - name: Dump TorSettings proxy methods
+      - name: Dump TorSettings 548 context
         run: |
           f=decoded/smali_classes3/org/mozilla/geckoview/TorSettings.smali
-          echo "===== 所有 Proxy 相关方法名 ====="
-          grep -nE "^\.method.*Proxy|^\.method.*proxy|^\.method.*Enabled" "$f" || echo none
+          echo "===== 520-620 行 ====="
+          sed -n '520,620p' "$f"
           echo ""
-          echo "===== 所有 iget-boolean proxyEnabled 读取处 ====="
-          grep -n "iget-boolean.*proxyEnabled" "$f" || echo none
-          echo ""
-          echo "===== 所有 iput-boolean proxyEnabled 设置处 ====="
-          grep -n "iput-boolean.*proxyEnabled" "$f" || echo none
-          echo ""
-          echo "===== 所有 iget proxyPort 读取处 ====="
-          grep -n "iget.*proxyPort\|iget.*proxyAddress" "$f" || echo none
-          echo ""
-          echo "===== 整个 getProxy* / isProxyEnabled 方法体 ====="
-          awk '/^\.method (public |private )?(final )?(static )?(is|get)Proxy/,/^\.end method/' "$f" | head -100
+          echo "===== 该行所在方法名 ====="
+          awk 'NR<=548 && /^\.method/ {m=$0} END {print m}' "$f"
 
-      - name: Dump GeckoAppShell proxy block
+      - name: Patch TorSettings proxyEnabled read at line 548
         run: |
-          f=decoded/smali_classes2/org/mozilla/gecko/GeckoAppShell.smali
-          echo "===== 前后 200 行（含 http.proxyHost 的那段） ====="
-          N=$(grep -n '"http\.proxyHost"' "$f" | head -1 | cut -d: -f1)
-          echo "http.proxyHost 出现在第 $N 行"
-          START=$((N - 100))
-          END=$((N + 100))
-          sed -n "${START},${END}p" "$f"
+          f=decoded/smali_classes3/org/mozilla/geckoview/TorSettings.smali
+          cp "$f" "$f.bak"
+          # 精确替换唯一一处 iget-boolean v4, ..., proxyEnabled:Z
+          sed -i 's|iget-boolean v4, p0, Lorg/mozilla/geckoview/TorSettings;->proxyEnabled:Z|const/4 v4, 0x0|g' "$f"
+          echo "===== TorSettings DIFF ====="
+          diff "$f.bak" "$f" || echo "(no changes)"
 
       - name: Patch GeckoAppShell proxy property names
         run: |
@@ -76,42 +66,6 @@ jobs:
           sed -i 's|"http\.proxyPort"|"http.proxyPort.disabled"|g' "$f"
           sed -i 's|"https\.proxyHost"|"https.proxyHost.disabled"|g' "$f"
           sed -i 's|"https\.proxyPort"|"https.proxyPort.disabled"|g' "$f"
-          sed -i 's|"socks\.proxyHost"|"socks.proxyHost.disabled"|g' "$f"
-          sed -i 's|"socks\.proxyPort"|"socks.proxyPort.disabled"|g' "$f"
-          echo "===== GeckoAppShell DIFF ====="
-          diff "$f.bak" "$f" || true
-
-      - name: Patch TorSettings proxy getters to return false
-        run: |
-          f=decoded/smali_classes3/org/mozilla/geckoview/TorSettings.smali
-          cp "$f" "$f.bak"
-          echo "===== 所有 getter 方法名（proxyEnabled/Enabled 等） ====="
-          grep -nE "^\.method public (final )?(is|get).*\(\)Z" "$f" | head -20
-
-          for M in isProxyEnabled getProxyEnabled isEnabled getEnabled; do
-            awk -v METHOD="$M" '
-              index($0, ".method public final " METHOD "()Z") > 0 {
-                print
-                print "    .locals 1"
-                print ""
-                print "    const/4 v0, 0x0"
-                print ""
-                print "    return v0"
-                in_m = 1
-                next
-              }
-              in_m && /^\.end method/ {
-                print
-                in_m = 0
-                next
-              }
-              in_m { next }
-              { print }
-            ' "$f" > "$f.tmp"
-            mv "$f.tmp" "$f"
-          done
-
-          echo "===== TorSettings DIFF ====="
           diff "$f.bak" "$f" || echo "(no changes)"
 
       - name: Patch nav_graph.xml
@@ -169,10 +123,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TS=$(date +%Y%m%d-%H%M)
-          TAG="v${VERSION}-fp-noproxy-${TS}"
+          TAG="v${VERSION}-fp-noproxy2-${TS}"
           gh release create "$TAG" \
             --repo ${{ github.repository }} \
-            --title "FP ${VERSION} 去Tor网络+去代理 ${TS}" \
-            --notes "Tor network removed + Tor proxy disabled + Tor onboarding bypassed." \
+            --title "FP ${VERSION} 去Tor网络+去代理v2 ${TS}" \
+            --notes "TorSettings.proxyEnabled forced false at source." \
             signed/*.apk
           echo "Release: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
