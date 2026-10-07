@@ -1,0 +1,65 @@
+name: FindProxy
+
+on:
+  push:
+    paths:
+      - '.github/workflows/find-proxy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  find:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip wget openjdk-17-jre-headless
+          wget -q -O apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+
+      - name: Get APK
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download cache-16.0a13 --repo ${{ github.repository }} -p "tor-orig.apk" --clobber
+
+      - name: Decompile
+        run: java -jar apktool.jar d tor-orig.apk -o out -f
+
+      - name: Find proxy settings
+        run: |
+          echo "########## 含 9050 或 9150 的 smali ##########"
+          grep -rln "9050\|9150" out/smali_classes*/ 2>/dev/null | head -30
+
+          echo ""
+          echo "########## 含 proxyHost / setProxy / proxyPort 的 smali ##########"
+          grep -rln "proxyHost\|setProxy\|proxyPort\|ProxyHost" out/smali_classes*/ 2>/dev/null | head -30
+
+          echo ""
+          echo "########## TorAndroidIntegration 位置 ##########"
+          find out/smali_classes* -name "*TorAndroidIntegration*" -type f 2>/dev/null
+
+          echo ""
+          echo "########## 含 127.0.0.1 的 smali ##########"
+          grep -rln '"127\.0\.0\.1"' out/smali_classes*/ 2>/dev/null | head -30
+
+      - name: Dump TorAndroidIntegration proxy code
+        run: |
+          f=$(find out/smali_classes* -name "TorAndroidIntegration.smali" 2>/dev/null | head -1)
+          if [ -z "$f" ]; then echo "no TorAndroidIntegration"; exit 0; fi
+          echo "=== $f ==="
+          grep -nE "9050|9150|proxy|Proxy|127\.0\.0\.1" "$f" | head -40
+
+      - name: Dump GeckoRuntimeSettings proxy code
+        run: |
+          f=$(find out/smali_classes* -name "GeckoRuntimeSettings*.smali" 2>/dev/null | head -5)
+          echo "$f" | while read line; do
+            [ -z "$line" ] && continue
+            echo "=== $line ==="
+            grep -nE "9050|9150|proxy|Proxy|127\.0\.0\.1" "$line" | head -20
+          done
