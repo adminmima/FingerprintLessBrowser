@@ -29,22 +29,26 @@ jobs:
       - name: Compile Java to dex then to smali
         run: |
           mkdir -p classes
-          javac --release 8 -encoding UTF-8 -d classes \
+          ANDROID_JAR=$(find /usr/local/lib/android/sdk/platforms -name android.jar 2>/dev/null | sort | tail -1)
+          echo "ANDROID_JAR=$ANDROID_JAR"
+          ls -lh "$ANDROID_JAR" || true
+          if [ -z "$ANDROID_JAR" ]; then
+            echo "ERROR: android.jar not found"
+            ls /usr/local/lib/android/sdk/platforms/ 2>/dev/null
+            exit 1
+          fi
+          javac -source 8 -target 8 -cp "$ANDROID_JAR" -encoding UTF-8 -d classes \
             com/fp/tools/FakeSocksServer.java \
             com/fp/tools/FakeSocksProvider.java
           ls -la classes/com/fp/tools/
           D8=$(find /usr/local/lib/android/sdk/build-tools -name d8 -type f 2>/dev/null | sort | tail -1)
           echo "Using d8: $D8"
-          # 需要 android.jar 里的 ContentProvider 类，用 d8 的 --lib 指定
-          ANDROID_JAR=$(find /usr/local/lib/android/sdk/platforms -name android.jar 2>/dev/null | sort | tail -1)
-          echo "Android jar: $ANDROID_JAR"
           "$D8" --min-api 21 --lib "$ANDROID_JAR" --output . classes/com/fp/tools/*.class
           ls -lh classes.dex
-          # 反汇编回 smali
           mkdir -p smali_out
           java -jar baksmali.jar d classes.dex -o smali_out/
           find smali_out -name "FakeSocks*.smali"
-          cat smali_out/com/fp/tools/FakeSocksProvider.smali | head -30
+          ls smali_out/com/fp/tools/
 
       - name: Get APK
         env:
