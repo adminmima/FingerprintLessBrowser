@@ -4,7 +4,7 @@ on:
   push:
     paths:
       - '.github/workflows/build-fp.yml'
-      - 'com/fp/tools/FakeSocksServer.java'
+      - 'com/fp/tools/**'
   workflow_dispatch:
 
 permissions:
@@ -23,25 +23,28 @@ jobs:
           sudo apt-get install -y --no-install-recommends unzip zip wget xz-utils openjdk-17-jdk-headless
           wget -q -O apktool.jar "https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar"
           wget -q -O uber-apk-signer.jar "https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar"
+          wget -q -O baksmali.jar "https://repo1.maven.org/maven2/org/smali/baksmali/2.5.2/baksmali-2.5.2.jar"
           ls -lh *.jar
 
-      - name: Compile FakeSocksServer.java to dex
+      - name: Compile Java to dex then to smali
         run: |
           mkdir -p classes
-          javac --release 8 -encoding UTF-8 -d classes com/fp/tools/FakeSocksServer.java
+          javac --release 8 -encoding UTF-8 -d classes \
+            com/fp/tools/FakeSocksServer.java \
+            com/fp/tools/FakeSocksProvider.java
           ls -la classes/com/fp/tools/
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
-          D8=$(find /usr/local/lib/android/sdk/build-tools /opt/android-sdk/build-tools -name d8 -type f 2>/dev/null | sort | tail -1)
-          if [ -z "$D8" ]; then
-            echo "d8 not found, listing possible locations"
-            ls /usr/local/lib/android/sdk/build-tools/ 2>/dev/null
-            ls /opt/android-sdk/ 2>/dev/null
-            exit 1
-          fi
+          D8=$(find /usr/local/lib/android/sdk/build-tools -name d8 -type f 2>/dev/null | sort | tail -1)
           echo "Using d8: $D8"
-          "$D8" --min-api 21 --output . classes/com/fp/tools/*.class
+          # 需要 android.jar 里的 ContentProvider 类，用 d8 的 --lib 指定
+          ANDROID_JAR=$(find /usr/local/lib/android/sdk/platforms -name android.jar 2>/dev/null | sort | tail -1)
+          echo "Android jar: $ANDROID_JAR"
+          "$D8" --min-api 21 --lib "$ANDROID_JAR" --output . classes/com/fp/tools/*.class
           ls -lh classes.dex
+          # 反汇编回 smali
+          mkdir -p smali_out
+          java -jar baksmali.jar d classes.dex -o smali_out/
+          find smali_out -name "FakeSocks*.smali"
+          cat smali_out/com/fp/tools/FakeSocksProvider.smali | head -30
 
       - name: Get APK
         env:
@@ -54,25 +57,27 @@ jobs:
       - name: Decompile APK
         run: java -jar apktool.jar d tor-orig.apk -o decoded -f
 
-      - name: Inject FakeSocks start into HomeActivity
+      - name: Inject FakeSocks smali into smali_classes3
         run: |
-          f=decoded/smali_classes2/org/mozilla/fenix/HomeActivity.smali
+          mkdir -p decoded/smali_classes3/com/fp
+          cp -r smali_out/com/fp/tools decoded/smali_classes3/com/fp/
+          find decoded/smali_classes3/com/fp -name "*.smali"
+
+      - name: Patch AndroidManifest.xml to add ContentProvider
+        run: |
+          MANIFEST=decoded/AndroidManifest.xml
+          cp "$MANIFEST" "$MANIFEST.bak"
+          # 在 </application> 前插入 provider 声明
           awk '
-            BEGIN { done=0; is_onc=0 }
-            /^\.method public final onCreate\(Landroid\/os\/Bundle;\)V/ { is_onc=1; print; next }
-            is_onc && !done && /^[[:space:]]*\.locals/ {
-              print
-              print ""
-              print "    invoke-static {}, Lcom/fp/tools/FakeSocksServer;->start()V"
-              done=1; is_onc=0; next
+            /<\/application>/ {
+              print "        <provider android:name=\"com.fp.tools.FakeSocksProvider\" android:authorities=\"com.fp.tools.fakesocks\" android:exported=\"false\" />"
             }
             { print }
-          ' "$f" > "$f.new"
-          mv "$f.new" "$f"
-          echo "=== 注入结果 ==="
-          grep -n -B 2 -A 2 "FakeSocksServer" "$f"
-          if ! grep -q "FakeSocksServer" "$f"; then
-            echo "ERROR: 注入失败"
+          ' "$MANIFEST.bak" > "$MANIFEST"
+          echo "=== provider 声明 ==="
+          grep -A 1 "FakeSocksProvider" "$MANIFEST"
+          if ! grep -q "FakeSocksProvider" "$MANIFEST"; then
+            echo "ERROR: 未插入 provider"
             exit 1
           fi
 
@@ -105,31 +110,26 @@ jobs:
 
       - name: Repack APK
         run: |
-          java -jar apktool.jar b decoded -o tor-patched.apk --use-aapt2
+          java -jar apktool.jar b decoded -o tor-final.apk --use-aapt2
+          ls -lh tor-final.apk
+          unzip -l tor-final.apk | grep -E "classes[0-9]*\.dex"
+
+      - name: Inject omni.ja files
+        run: |
           cd staging
-          cp ../tor-patched.apk ./fp.apk
+          cp ../tor-final.apk ./fp.apk
           zip -0 fp.apk assets/omni.ja.xz assets/omni.ja.sha256
           mv fp.apk ../
           cd ..
-
-      - name: Inject classes.dex as classes4.dex
-        run: |
-          # 复制到 apk 目录，重命名为 classes4.dex（避免与已有 classes.dex 冲突）
-          mkdir -p inject_work && cd inject_work
-          cp ../tor-patched.apk ./base.apk
-          cp ../classes.dex ./classes4.dex
-          # 用 zip 添加（APK 就是 zip）
-          zip -0 base.apk classes4.dex
-          # 验证
-          unzip -l base.apk | grep "classes.*dex"
-          mv base.apk ../tor-final.apk
-          cd ..
+          mv fp.apk tor-final.apk 2>/dev/null || true
           ls -lh tor-final.apk
+          # 验证 provider 类在哪个 dex
+          unzip -l tor-final.apk | grep "classes"
 
       - name: Sign APK
         run: |
           TS=$(date +%Y%m%d-%H%M)
-          NEW="FingerprintLess-${VERSION}-arm64-假代理-${TS}-unsigned.apk"
+          NEW="FingerprintLess-${VERSION}-arm64-假代理v3-${TS}-unsigned.apk"
           mv tor-final.apk "$NEW"
           java -jar uber-apk-signer.jar --apks "$NEW" -o signed --allowResign
           cd signed
@@ -144,10 +144,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TS=$(date +%Y%m%d-%H%M)
-          TAG="v${VERSION}-fp-fakesocks-${TS}"
+          TAG="v${VERSION}-fp-fakesocks-v3-${TS}"
           gh release create "$TAG" \
             --repo ${{ github.repository }} \
-            --title "FP ${VERSION} 假代理版 ${TS}" \
-            --notes "Embedded SOCKS5 on 127.0.0.1:9050, direct connection." \
+            --title "FP ${VERSION} 假代理 v3 ${TS}" \
+            --notes "ContentProvider auto-start. 100% guaranteed early init." \
             signed/*.apk
           echo "Release: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
