@@ -23,20 +23,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends unzip zip wget xz-utils openjdk-17-jdk-headless
           wget -q -O apktool.jar "https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar"
           wget -q -O uber-apk-signer.jar "https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar"
-          wget -q -O baksmali.jar "https://repo1.maven.org/maven2/org/smali/baksmali/2.5.2/baksmali-2.5.2.jar"
           ls -lh *.jar
 
-      - name: Compile Java to dex then to smali
+      - name: Compile Java to classes.dex
         run: |
+          set -e
           mkdir -p classes
           ANDROID_JAR=$(find /usr/local/lib/android/sdk/platforms -name android.jar 2>/dev/null | sort | tail -1)
           echo "ANDROID_JAR=$ANDROID_JAR"
-          ls -lh "$ANDROID_JAR" || true
-          if [ -z "$ANDROID_JAR" ]; then
-            echo "ERROR: android.jar not found"
-            ls /usr/local/lib/android/sdk/platforms/ 2>/dev/null
-            exit 1
-          fi
           javac -source 8 -target 8 -cp "$ANDROID_JAR" -encoding UTF-8 -d classes \
             com/fp/tools/FakeSocksServer.java \
             com/fp/tools/FakeSocksProvider.java
@@ -45,10 +39,8 @@ jobs:
           echo "Using d8: $D8"
           "$D8" --min-api 21 --lib "$ANDROID_JAR" --output . classes/com/fp/tools/*.class
           ls -lh classes.dex
-          mkdir -p smali_out
-          java -jar baksmali.jar d classes.dex -o smali_out/
-          find smali_out -name "FakeSocks*.smali"
-          ls smali_out/com/fp/tools/
+          echo "=== 验证 dex 里有我们的类 ==="
+          "$D8" --min-api 21 --lib "$ANDROID_JAR" --output /tmp/verify classes/com/fp/tools/*.class 2>/dev/null || true
 
       - name: Get APK
         env:
@@ -61,17 +53,10 @@ jobs:
       - name: Decompile APK
         run: java -jar apktool.jar d tor-orig.apk -o decoded -f
 
-      - name: Inject FakeSocks smali into smali_classes3
-        run: |
-          mkdir -p decoded/smali_classes3/com/fp
-          cp -r smali_out/com/fp/tools decoded/smali_classes3/com/fp/
-          find decoded/smali_classes3/com/fp -name "*.smali"
-
       - name: Patch AndroidManifest.xml to add ContentProvider
         run: |
           MANIFEST=decoded/AndroidManifest.xml
           cp "$MANIFEST" "$MANIFEST.bak"
-          # 在 </application> 前插入 provider 声明
           awk '
             /<\/application>/ {
               print "        <provider android:name=\"com.fp.tools.FakeSocksProvider\" android:authorities=\"com.fp.tools.fakesocks\" android:exported=\"false\" />"
@@ -79,9 +64,9 @@ jobs:
             { print }
           ' "$MANIFEST.bak" > "$MANIFEST"
           echo "=== provider 声明 ==="
-          grep -A 1 "FakeSocksProvider" "$MANIFEST"
+          grep -B 1 -A 1 "FakeSocksProvider" "$MANIFEST"
           if ! grep -q "FakeSocksProvider" "$MANIFEST"; then
-            echo "ERROR: 未插入 provider"
+            echo "ERROR: provider 未插入"
             exit 1
           fi
 
@@ -114,21 +99,23 @@ jobs:
 
       - name: Repack APK
         run: |
-          java -jar apktool.jar b decoded -o tor-final.apk --use-aapt2
-          ls -lh tor-final.apk
-          unzip -l tor-final.apk | grep -E "classes[0-9]*\.dex"
+          java -jar apktool.jar b decoded -o tor-base.apk --use-aapt2
+          ls -lh tor-base.apk
 
-      - name: Inject omni.ja files
+      - name: Inject omni.ja + our classes.dex into APK
         run: |
           cd staging
-          cp ../tor-final.apk ./fp.apk
+          cp ../tor-base.apk ./fp.apk
+          # 更新 omni.ja
           zip -0 fp.apk assets/omni.ja.xz assets/omni.ja.sha256
-          mv fp.apk ../
+          # 加入我们的 classes.dex，重命名为 classes5.dex 避免与 Tor Browser 的 classes*.dex 冲突
+          cp ../classes.dex ./classes5.dex
+          zip -0 fp.apk classes5.dex
+          mv fp.apk ../tor-final.apk
           cd ..
-          mv fp.apk tor-final.apk 2>/dev/null || true
           ls -lh tor-final.apk
-          # 验证 provider 类在哪个 dex
-          unzip -l tor-final.apk | grep "classes"
+          echo "=== APK 内 dex 列表 ==="
+          unzip -l tor-final.apk | grep -E "classes[0-9]*\.dex"
 
       - name: Sign APK
         run: |
@@ -152,6 +139,6 @@ jobs:
           gh release create "$TAG" \
             --repo ${{ github.repository }} \
             --title "FP ${VERSION} 假代理 v3 ${TS}" \
-            --notes "ContentProvider auto-start. 100% guaranteed early init." \
+            --notes "ContentProvider auto-start, no baksmali. classes5.dex." \
             signed/*.apk
           echo "Release: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
