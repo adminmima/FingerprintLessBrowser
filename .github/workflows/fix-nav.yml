@@ -1,0 +1,69 @@
+name: Fix Nav Graph
+
+on:
+  workflow_dispatch:
+    inputs:
+      tor_version:
+        required: true
+        default: '16.0a13'
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip zip wget xz-utils openjdk-17-jre-headless xmlstarlet
+          wget -q -O apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+          wget -q -O uber-apk-signer.jar https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar
+
+      - name: Download APK
+        run: |
+          V="${{ inputs.tor_version }}"
+          wget -q -O tor-orig.apk "https://dist.torproject.org/torbrowser/${V}/tor-browser-android-aarch64-${V}.apk"
+
+      - name: Decompile
+        run: java -jar apktool.jar d tor-orig.apk -o out -f
+
+      - name: Find nav graphs
+        run: |
+          echo "========== 所有 navigation xml =========="
+          find out/res -path "*navigation*" -name "*.xml"
+          
+          echo ""
+          echo "========== 所有含 tor 的 xml 资源 =========="
+          grep -rln "tor" out/res/navigation/ 2>/dev/null
+          
+          echo ""
+          echo "========== 含 TorConnectionAssistFragment 的文件 =========="
+          grep -rln "TorConnectionAssist\|tor_connection_assist" out/res/ 2>/dev/null
+
+      - name: Dump nav graph contents
+        run: |
+          for f in $(find out/res -path "*navigation*" -name "*.xml"); do
+            echo "########## $f ##########"
+            cat "$f"
+            echo ""
+          done
+
+      - name: Find who navigates to tor assist
+        run: |
+          echo "========== 谁引用 tor_connection_assist =========="
+          grep -rln "tor_connection_assist\|torConnectionAssist\|TorConnectionAssist" out/ 2>/dev/null | head -30
+
+      - name: Upload decompiled res
+        uses: actions/upload-artifact@v4
+        with:
+          name: nav-dump-${{ inputs.tor_version }}
+          path: |
+            out/res/navigation/
+            out/res/xml/
+          retention-days: 7
+          if-no-files-found: warn
