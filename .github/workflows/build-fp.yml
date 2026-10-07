@@ -40,47 +40,117 @@ jobs:
       - name: Decompile
         run: java -jar apktool.jar d tor-orig.apk -o decoded -f
 
+      - name: Dump TorSettings getters/setters
+        run: |
+          echo "########## TorSettings 所有 Proxy 相关方法 ##########"
+          awk '/\.method.*Proxy/,/\.end method/' \
+            decoded/smali_classes3/org/mozilla/geckoview/TorSettings.smali | head -200
+
+      - name: Dump GeckoAppShell proxy block
+        run: |
+          echo "########## GeckoAppShell.smali 第 3650-3800 行 ##########"
+          sed -n '3650,3800p' decoded/smali_classes2/org/mozilla/gecko/GeckoAppShell.smali
+
+      - name: Dump TorAndroidIntegration SettingsLoader
+        run: |
+          echo "########## SettingsLoader 全部内容 ##########"
+          cat "decoded/smali_classes3/org/mozilla/geckoview/TorAndroidIntegration\$SettingsLoader.smali" 2>/dev/null | head -150
+
+      - name: Patch TorSettings - force proxyEnabled false
+        run: |
+          f=decoded/smali_classes3/org/mozilla/geckoview/TorSettings.smali
+
+          # 策略：把所有 "iget-boolean ...->proxyEnabled" 之后的读取都强行返回 false
+          # 更简单粗暴：找到 getter 方法，把方法体改为 return false
+          echo "=== 找 getProxyEnabled / isProxyEnabled 方法 ==="
+          grep -nE "\.method.*ProxyEnabled" "$f" || echo "no explicit getter"
+          
+          echo "=== 所有 iput-boolean 到 proxyEnabled 的指令（设置处）==="
+          grep -n "iput-boolean.*proxyEnabled" "$f"
+          
+          echo "=== 所有 iget-boolean 从 proxyEnabled 的指令（读取处）==="
+          grep -n "iget-boolean.*proxyEnabled" "$f"
+
+          # 暴力 patch：把所有 iput-boolean 到 proxyEnabled 改为 iput-boolean 0x0
+          # 这保证所有 setter 都写入 false
+          python3 - "$f" <<'PYEOF'
+import sys, re
+path = sys.argv[1]
+lines = open(path).readlines()
+count = 0
+for i, line in enumerate(lines):
+    # 匹配 "iput-boolean vX, p0, Lorg/mozilla/geckoview/TorSettings;->proxyEnabled:Z"
+    if 'iput-boolean' in line and '->proxyEnabled:Z' in line:
+        # 提取缩进和后面的注释（保持格式）
+        m = re.match(r'^(\s*)iput-boolean\s+\S+,\s*(\S+),\s*(Lorg/mozilla/geckoview/TorSettings;->proxyEnabled:Z.*)$', line)
+        if m:
+            indent, obj, rest = m.groups()
+            # 把值改为 0x0（false）。常量寄存器需要先声明，但 0x0 是特殊立即数
+            # iput-boolean 不接受立即数，必须用寄存器。所以要用 const/4 先加载 0
+            # 简化：只改 p1 这种明显是参数的地方→ 但那会破坏语义
+            # 更安全：在每个 iput-boolean 前插入 const/4 + 改寄存器
+            # 但这里直接换成 v_ 可能寄存器冲突
+            pass
+    count += 1
+
+# 更安全的做法：改写 getter 方法
+# 找到 "iget-boolean vX, p0, ...->proxyEnabled:Z" 所在的方法，把返回值改为 0
+new_lines = []
+i = 0
+patched_methods = []
+while i < len(lines):
+    line = lines[i]
+    # 找到方法声明
+    m = re.match(r'^\.method public final (isProxyEnabled|getProxyEnabled)\(\)Z', line)
+    if m:
+        # 记录该方法开始
+        method_name = m.group(1)
+        start = i
+        # 找到方法结束
+        while i < len(lines) and not lines[i].strip().startswith('.end method'):
+            i += 1
+        # i 现在在 .end method 行
+        # 替换方法体为：.locals 1 / const/4 v0, 0x0 / return v0
+        new_lines.append(line)
+        new_lines.append('    .locals 1')
+        new_lines.append('')
+        new_lines.append('    const/4 v0, 0x0')
+        new_lines.append('')
+        new_lines.append('    return v0')
+        new_lines.append(lines[i])  # .end method
+        patched_methods.append(method_name)
+        i += 1
+        continue
+    new_lines.append(line)
+    i += 1
+
+open(path, 'w').writelines(new_lines)
+print(f"Patched methods: {patched_methods}")
+PYEOF
+
+          echo "=== 修改后 ==="
+          grep -nE "\.method.*ProxyEnabled" "$f"
+          awk '/\.method.*isProxyEnabled|\.method.*getProxyEnabled/,/\.end method/' "$f"
+
+      - name: Patch GeckoAppShell http.proxyHost
+        run: |
+          f=decoded/smali_classes2/org/mozilla/gecko/GeckoAppShell.smali
+          echo "=== 找相关方法名 ==="
+          grep -nB 3 "http.proxyHost" "$f" | head -20
+
+          # 更暴力：把所有 "http.proxyHost"/"http.proxyPort" 等常量字符串改为空前缀（无效）
+          # 这样即使代码试图读/写这些属性，也拿不到有意义的值
+          sed -i 's|"http\.proxyHost"|"http.proxyHost.disabled"|g' "$f"
+          sed -i 's|"http\.proxyPort"|"http.proxyPort.disabled"|g' "$f"
+          sed -i 's|"https\.proxyHost"|"https.proxyHost.disabled"|g' "$f"
+          sed -i 's|"https\.proxyPort"|"https.proxyPort.disabled"|g' "$f"
+          echo "=== 修改后 ==="
+          grep -n "proxy" "$f" | head -20
+
       - name: Patch nav_graph.xml
         run: |
           NAV=decoded/res/navigation/nav_graph.xml
           sed -i 's|org\.mozilla\.fenix\.tor\.TorConnectionAssistFragment|org.mozilla.fenix.home.HomeFragment|g' "$NAV"
-
-      - name: Dump proxy code for diagnosis
-        run: |
-          echo "########## TorSettings.smali proxy 相关 ##########"
-          grep -nE "proxy|Proxy|9050|9150|127\.0\.0\.1|setSocks|socks" \
-            decoded/smali_classes3/org/mozilla/geckoview/TorSettings.smali 2>/dev/null | head -60
-
-          echo ""
-          echo "########## GeckoAppShell.smali proxy 相关 ##########"
-          grep -nE "setProxy|proxyHost|proxyPort|9050|9150|127\.0\.0\.1|socks|Socks" \
-            decoded/smali_classes2/org/mozilla/gecko/GeckoAppShell.smali 2>/dev/null | head -40
-
-          echo ""
-          echo "########## 其他含 9050 的文件 ##########"
-          grep -rln "9050\|9150" decoded/smali_classes*/ 2>/dev/null
-
-      - name: Patch proxy strings
-        run: |
-          for f in decoded/smali_classes3/org/mozilla/geckoview/TorSettings.smali \
-                   decoded/smali_classes2/org/mozilla/gecko/GeckoAppShell.smali; do
-            [ -f "$f" ] || continue
-            echo "=========== Patching: $f ==========="
-            cp "$f" "$f.bak"
-            sed -i 's|"127\.0\.0\.1:9050"|""|g' "$f"
-            sed -i 's|"127\.0\.0\.1:9150"|""|g' "$f"
-            sed -i 's|"127\.0\.0\.1"|""|g' "$f"
-            sed -i 's|"localhost"|""|g' "$f"
-            sed -i 's|"9050"|""|g' "$f"
-            sed -i 's|"9150"|""|g' "$f"
-            sed -i 's|0x235a|0x0|g' "$f"
-            sed -i 's|0x235A|0x0|g' "$f"
-            sed -i 's|0x23be|0x0|g' "$f"
-            sed -i 's|0x23BE|0x0|g' "$f"
-            echo "=== DIFF (before vs after) ==="
-            diff "$f.bak" "$f" || true
-            echo ""
-          done
 
       - name: Patch omni.ja prefs
         run: |
@@ -96,11 +166,7 @@ jobs:
           pref("network.proxy.socks", "");
           pref("network.proxy.socks_port", 0);
           pref("network.proxy.socks_remote_dns", false);
-          pref("network.proxy.socks_version", 0);
           pref("extensions.torlauncher.start_tor", false);
-          pref("extensions.torlauncher.quickstart", false);
-          pref("extensions.torlauncher.prompt_at_startup", false);
-          pref("extensions.torbutton.startup", false);
           PREFEOF
           zip -q -r -0 ../omni-new.ja ./*
           cd ..
