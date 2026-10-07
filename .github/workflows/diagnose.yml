@@ -1,0 +1,76 @@
+name: Diagnose Launch Path
+
+on:
+  workflow_dispatch:
+    inputs:
+      tor_version:
+        required: true
+        default: '16.0a13'
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip wget openjdk-17-jre-headless
+          wget -q -O apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+
+      - name: Download APK
+        run: |
+          V="${{ inputs.tor_version }}"
+          wget -q -O tor.apk "https://dist.torproject.org/torbrowser/${V}/tor-browser-android-aarch64-${V}.apk"
+
+      - name: Decompile
+        run: java -jar apktool.jar d tor.apk -o out -f
+
+      - name: Print AndroidManifest activities
+        run: |
+          echo "========== LAUNCHER Activity =========="
+          grep -B 5 -A 20 "LAUNCHER" out/AndroidManifest.xml || echo "not found"
+
+          echo ""
+          echo "========== 所有含 intent-filter 的 activity =========="
+          awk '
+            /<activity/ { buf=$0; in_act=1; next }
+            in_act && /<\/activity>/ { print buf; in_act=0; buf=""; next }
+            in_act { buf = buf "\n" $0 }
+          ' out/AndroidManifest.xml | head -100
+
+          echo ""
+          echo "========== 所有 activity name =========="
+          grep -oE '<activity[^>]*android:name="[^"]*"' out/AndroidManifest.xml | sed 's/.*android:name=//'
+
+      - name: Print Fragment onCreateView full
+        run: |
+          echo "========== TorConnectionAssistFragment onCreateView =========="
+          awk '/\.method public final onCreateView/,/\.end method/' \
+            out/smali_classes2/org/mozilla/fenix/tor/TorConnectionAssistFragment.smali
+
+          echo ""
+          echo "========== onCreateView 里调用的方法名（关键） =========="
+          awk '/\.method public final onCreateView/,/\.end method/' \
+            out/smali_classes2/org/mozilla/fenix/tor/TorConnectionAssistFragment.smali \
+            | grep -E "invoke-.*->" | sed 's/.*->//' | sort -u
+
+      - name: Find Home/Browser activity
+        run: |
+          echo "========== HomeActivity / BrowserActivity smali 存在检查 =========="
+          find out/smali_classes* -iname "HomeActivity*.smali" 2>/dev/null
+          find out/smali_classes* -iname "BrowserActivity*.smali" 2>/dev/null
+
+      - name: Upload manifest and fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnose-${{ inputs.tor_version }}
+          path: |
+            out/AndroidManifest.xml
+            out/smali_classes2/org/mozilla/fenix/tor/TorConnectionAssistFragment.smali
+          retention-days: 7
