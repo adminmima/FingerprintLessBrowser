@@ -24,21 +24,22 @@ jobs:
           wget -q -O apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
           wget -q -O uber-apk-signer.jar https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar
 
-      - name: Download APK
+      - name: Get APK from cache release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           V="${{ inputs.tor_version }}"
-          wget -q -O tor-orig.apk "https://dist.torproject.org/torbrowser/${V}/tor-browser-android-aarch64-${V}.apk"
+          gh release download "cache-${V}" \
+            --repo ${{ github.repository }} \
+            -p "tor-orig.apk" \
+            --clobber
           ls -lh tor-orig.apk
 
       # ============ Patch 1: omni.ja prefs ============
-      - name: Extract omni.ja.xz
+      - name: Patch omni.ja prefs
         run: |
           mkdir -p staging && cd staging
           unzip -o ../tor-orig.apk assets/omni.ja.xz assets/omni.ja.sha256
-
-      - name: Patch omni.ja prefs
-        run: |
-          cd staging
           cp assets/omni.ja.xz omni.ja.xz
           xz -d omni.ja.xz
           mkdir omni_content && cd omni_content
@@ -61,37 +62,23 @@ jobs:
           echo "$NEW_SHA" > assets/omni.ja.sha256
           cp omni-new.ja.xz assets/omni.ja.xz
 
-      # ============ Patch 2: smali 绕过引导页 ============
-      - name: Decompile APK with apktool
+      # ============ Patch 2: nav_graph.xml 改起点 ============
+      - name: Decompile APK
         run: |
           java -jar apktool.jar d tor-orig.apk -o decoded -f
-          ls decoded/smali_classes2/org/mozilla/fenix/tor/ | head -20
 
-      - name: Patch TorConnectionAssistViewModel smali
+      - name: Patch nav_graph.xml startDestination
         run: |
-          TARGET=decoded/smali_classes2/org/mozilla/fenix/tor/TorConnectionAssistViewModel\$collectTorConnectStage\$2.smali
+          NAV=decoded/res/navigation/nav_graph.xml
           echo "=== Before ==="
-          grep -A 14 ":pswitch_data_0" "$TARGET"
+          grep -oE 'app:startDestination="[^"]*"' "$NAV" | head -1
           
-          # 在 packed-switch 段内，把第8个 :pswitch_6 改为 :pswitch_1
-          # 用 awk 精确控制在 .packed-switch 到 .end packed-switch 之间替换
-          awk '
-            /\.packed-switch/ { in_switch=1; print; next }
-            /\.end packed-switch/ { in_switch=0; print; next }
-            in_switch && /^[[:space:]]*:pswitch_6[[:space:]]*$/ {
-              # 保留缩进
-              match($0, /^[[:space:]]*/)
-              indent = substr($0, 1, RLENGTH)
-              print indent ":pswitch_1"
-              next
-            }
-            { print }
-          ' "$TARGET" > "${TARGET}.new"
-          mv "${TARGET}.new" "$TARGET"
+          # 把顶层 navigation 标签的 startDestination 改为 homeFragment
+          # 只替换第一处（顶层 navigation 标签里的）
+          perl -0pi -e 's/(<navigation[^>]*?startDestination=")[^"]*(")/${1}\@id\/homeFragment${2}/' "$NAV"
           
-          echo ""
           echo "=== After ==="
-          grep -A 14 ":pswitch_data_0" "$TARGET"
+          grep -oE 'app:startDestination="[^"]*"' "$NAV" | head -1
 
       - name: Repack APK
         run: |
@@ -99,12 +86,10 @@ jobs:
           ls -lh tor-patched-unsigned.apk
 
       # ============ 合并 Patch 1 到新 APK ============
-      - name: Apply omni.ja changes to patched APK
+      - name: Apply omni.ja changes
         run: |
-          # 从 staging 里拷贝我们改过的 omni.ja.xz 到新 APK
           cd staging
           cp ../tor-patched-unsigned.apk ./tor-patched.apk
-          # 用 zip 更新 APK 里的两个文件
           zip -0 tor-patched.apk assets/omni.ja.xz assets/omni.ja.sha256
           mv tor-patched.apk ../
           cd ..
@@ -124,7 +109,7 @@ jobs:
           gh release create "$TAG" \
             --repo ${{ github.repository }} \
             --title "FingerprintLess ${V}" \
-            --notes "基于 Tor Browser ${V}（arm64-v8a）。已移除 Tor 网络，直连互联网，完整保留反指纹保护（Canvas / WebGL / 时区 / 字体 / 窗口尺寸等）。" \
+            --notes "基于 Tor Browser ${V}。已移除 Tor 网络，直连互联网，完整保留反指纹保护。App 启动直接进主页，跳过 Tor 引导。" \
             signed/*.apk \
             || gh release upload "$TAG" signed/*.apk --clobber --repo ${{ github.repository }}
           echo "Release: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
