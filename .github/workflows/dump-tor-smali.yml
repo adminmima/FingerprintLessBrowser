@@ -1,0 +1,84 @@
+name: Dump Tor Smali to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tor_version:
+        required: true
+        default: '16.0a13'
+
+permissions:
+  contents: write
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip wget zip openjdk-17-jre-headless
+          wget -q -O apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+
+      - name: Download APK
+        run: |
+          V="${{ inputs.tor_version }}"
+          wget -q -O tor.apk "https://dist.torproject.org/torbrowser/${V}/tor-browser-android-aarch64-${V}.apk"
+
+      - name: Decompile
+        run: java -jar apktool.jar d tor.apk -o out -f
+
+      - name: Collect Tor related smali and metadata
+        run: |
+          mkdir -p dump
+
+          # 1. fenix/tor 整个包
+          if [ -d out/smali_classes2/org/mozilla/fenix/tor ]; then
+            cp -r out/smali_classes2/org/mozilla/fenix/tor dump/fenix-tor
+          fi
+
+          # 2. AndroidManifest
+          cp out/AndroidManifest.xml dump/
+
+          # 3. 关键 smali 文件的调用点列表
+          grep -rln "TorConnectionAssistFragment" out/smali_classes* 2>/dev/null > dump/callers-TorConnectionAssistFragment.txt || true
+          grep -rln "ConnectAssistUiState" out/smali_classes* 2>/dev/null > dump/callers-ConnectAssistUiState.txt || true
+          grep -rln "TorService\|TorConnect\|Bootstrap" out/smali_classes* 2>/dev/null | grep -iv "Detector\|Iterator" > dump/callers-TorService.txt || true
+
+          # 4. defaults/pref 内容
+          mkdir -p dump/omni
+          cd work 2>/dev/null || mkdir -p work
+          cd ..
+          mkdir -p omni_work && cd omni_work
+          unzip -q ../tor.apk assets/omni.ja.xz assets/omni.ja.sha256
+          cp assets/omni.ja.xz omni.ja.xz
+          xz -d omni.ja.xz
+          mkdir omni_inner && cd omni_inner
+          unzip -q ../omni.ja
+          cp defaults/pref/000-tor-browser.js ../../dump/omni/
+          cd ../..
+          cp omni_work/dump/omni/000-tor-browser.js dump/omni/ 2>/dev/null || true
+
+          # 5. 打包
+          zip -r -q tor-analysis-${V:-16.0a13}.zip dump/
+          ls -lh tor-analysis-*.zip
+          find dump -type f | head -50
+        env:
+          V: ${{ inputs.tor_version }}
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V="${{ inputs.tor_version }}"
+          TAG="analysis-v${V}"
+          gh release create "$TAG" \
+            --repo ${{ github.repository }} \
+            --title "Tor Analysis ${V} (分析文件)" \
+            --notes "Tor Browser ${V} 反编译分析结果。包含 fenix/tor 包 smali、AndroidManifest、调用点列表、omni.ja prefs 内容。" \
+            tor-analysis-*.zip \
+            || gh release upload "$TAG" tor-analysis-*.zip --clobber --repo ${{ github.repository }}
+          echo "Done: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
