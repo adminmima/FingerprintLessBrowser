@@ -1,0 +1,70 @@
+name: FindJump | 定位跳转引导页的代码
+
+on:
+  workflow_dispatch:
+    inputs:
+      tor_version:
+        required: true
+        default: '16.0a13'
+
+permissions:
+  contents: read
+
+jobs:
+  find:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip wget openjdk-17-jre-headless
+          wget -q -O apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+
+      - name: Get cached APK
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V="${{ inputs.tor_version }}"
+          gh release download "cache-${V}" --repo ${{ github.repository }} -p "tor-orig.apk" --clobber
+
+      - name: Decompile
+        run: java -jar apktool.jar d tor-orig.apk -o out -f
+
+      - name: Find all references to torConnectionAssistFragment
+        run: |
+          echo "########## 所有引用 torConnectionAssistFragment 的 smali ##########"
+          grep -rln "torConnectionAssistFragment\|TorConnectionAssistFragment" out/smali_classes* 2>/dev/null
+
+          echo ""
+          echo "########## 谁调用 navigate 到 torConnectionAssist ##########"
+          grep -rn "torConnectionAssistFragment" out/smali_classes* 2>/dev/null | grep -iE "navigate|NavDirections|setStartDestination|action" | head -30
+
+      - name: Find HomeActivity
+        run: |
+          echo "########## HomeActivity 位置 ##########"
+          find out/smali_classes* -name "HomeActivity.smali"
+
+          echo ""
+          echo "########## HomeActivity 里 navigate 调用 ##########"
+          find out/smali_classes* -name "HomeActivity.smali" -exec grep -nE "torConnectionAssist|startupFragment|navController|NavController|navigate|setGraph|nav_graph" {} \; | head -40
+
+      - name: Find setGraph and start destination logic
+        run: |
+          echo "########## 所有调用 setGraph 的文件 ##########"
+          grep -rln "setGraph" out/smali_classes2/org/mozilla/fenix/ 2>/dev/null | head -20
+
+          echo ""
+          echo "########## HomeActivity onCreate 方法 ##########"
+          find out/smali_classes* -name "HomeActivity.smali" -exec awk '/\.method.*onCreate\(/,/\.end method/' {} \; 2>/dev/null | head -200
+
+      - name: Find the initial navigation decision
+        run: |
+          echo "########## 搜索所有含 torConnectionAssist 且含 navigate 的完整上下文 ##########"
+          for f in $(grep -rln "torConnectionAssistFragment" out/smali_classes* 2>/dev/null | head -20); do
+            echo "=== $f ==="
+            grep -B 3 -A 5 "torConnectionAssistFragment" "$f" | head -30
+            echo ""
+          done
