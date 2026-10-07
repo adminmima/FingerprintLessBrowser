@@ -1,4 +1,4 @@
-name: PatchAPK | 修改Tor浏览器APK去Tor网络（三变体）
+name: "PatchAPK-three-variants"
 
 on:
   workflow_dispatch:
