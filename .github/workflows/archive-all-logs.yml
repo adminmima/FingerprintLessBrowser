@@ -4,21 +4,16 @@ name: 归档所有历史日志
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   archive:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装 GitHub CLI
+      - name: 安装依赖
         run: |
-          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-          sudo apt-get update && sudo apt-get install gh -y
+          sudo apt-get update
+          sudo apt-get install -y gh jq
 
       - name: 下载并归档所有日志
         env:
@@ -26,155 +21,67 @@ jobs:
         run: |
           REPO="${{ github.repository }}"
           DATE="2026-10-07"
-          ARCHIVE_DIR="归档/${DATE}"
+          ARCHIVE_DIR="归档-${DATE}"
           mkdir -p "${ARCHIVE_DIR}"
 
           echo "=== 获取工作流列表 ==="
-          gh workflow list --repo "$REPO" --json id,name,path > "${ARCHIVE_DIR}/工作流清单.json"
+          gh workflow list --repo "$REPO" --json id,name > "${ARCHIVE_DIR}/工作流清单.json"
           
-          # 创建总览文件（中文）
-          cat > "${ARCHIVE_DIR}/总览说明.md" << 'EOF'
+          cat > "${ARCHIVE_DIR}/总览说明.md" << EOF
           # 工作流历史归档总览
           
-          - 归档日期：2026-10-07
-          - 仓库：${{ github.repository }}
-          - 说明：本次归档包含3个工作流的全部历史运行日志
+          - 归档日期：${DATE}
+          - 仓库：${REPO}
           
           ## 工作流列表
           EOF
-          
-          # 工作流名称映射（英文原名 → 中文名称）
-          declare -A WF_NAME_MAP=(
-            ["Analyze Tor Structure"]="分析Tor结构"
-            ["Detect Tor Layer"]="检测Tor层级"
-            ["Verify Tor Launch Path"]="验证Tor启动路径"
-          )
 
-          # 遍历每个工作流
           for wf_id in $(jq -r '.[].id' "${ARCHIVE_DIR}/工作流清单.json"); do
-            wf_name_en=$(jq -r ".[] | select(.id==${wf_id}) | .name" "${ARCHIVE_DIR}/工作流清单.json")
-            wf_name_cn="${WF_NAME_MAP[$wf_name_en]:-$wf_name_en}"
-            wf_safe=$(echo "$wf_name_en" | sed 's/[^a-zA-Z0-9]/_/g')
+            wf_name=$(jq -r ".[] | select(.id==${wf_id}) | .name" "${ARCHIVE_DIR}/工作流清单.json")
+            wf_safe=$(echo "$wf_name" | sed 's/[^a-zA-Z0-9]/_/g')
             
-            echo "处理工作流：$wf_name_cn（$wf_name_en）"
-            echo "- **$wf_name_cn**（$wf_name_en）" >> "${ARCHIVE_DIR}/总览说明.md"
+            echo "处理：${wf_name}"
+            echo "- **${wf_name}**" >> "${ARCHIVE_DIR}/总览说明.md"
             
-            # 获取所有运行
-            runs_file="${ARCHIVE_DIR}/${wf_safe}-${wf_name_cn}-运行记录.json"
+            # 获取运行
+            runs_file="${ARCHIVE_DIR}/${wf_safe}-运行记录.json"
             gh run list --repo "$REPO" --workflow="$wf_id" -L 100 \
-              --json databaseId,status,conclusion,createdAt,updatedAt,headBranch,event,url,displayTitle \
-              > "$runs_file" 2>/dev/null || echo "[]" > "$runs_file"
+              --json databaseId,status,conclusion,createdAt,headBranch,event,url \
+              > "$runs_file" 2>&1 || echo "[]" > "$runs_file"
             
             run_count=$(jq 'length' "$runs_file")
-            echo "  - 运行次数：${run_count}" >> "${ARCHIVE_DIR}/总览说明.md"
+            echo "  运行次数：${run_count}" >> "${ARCHIVE_DIR}/总览说明.md"
             
-            # 日志目录
-            logs_dir="${ARCHIVE_DIR}/${wf_safe}-${wf_name_cn}-原始日志"
+            # 下载日志
+            logs_dir="${ARCHIVE_DIR}/${wf_safe}-原始日志"
             mkdir -p "$logs_dir"
             
-            # 逐个下载
             for run_id in $(jq -r '.[].databaseId' "$runs_file" 2>/dev/null); do
-              log_file="${logs_dir}/运行${run_id}.log"
-              
-              echo "  下载运行 $run_id ..."
-              gh run view --repo "$REPO" "$run_id" --log > "$log_file" 2>&1 || {
-                echo "下载失败: 运行ID=$run_id, 工作流=$wf_name_cn" >> "${logs_dir}/下载失败记录.txt"
+              echo "  下载运行 ${run_id}..."
+              gh run view --repo "$REPO" "$run_id" --log > "${logs_dir}/运行${run_id}.log" 2>&1 || {
+                echo "失败: ${run_id}" >> "${logs_dir}/下载失败记录.txt"
                 continue
               }
               
-              # 脱敏
-              sed -i \
-                -e 's/ghp_[a-zA-Z0-9]\{36\}/[GITHUB_TOKEN_已脱敏]/g' \
-                -e 's/glpat-[a-zA-Z0-9_-]\{20\}/[GITLAB_TOKEN_已脱敏]/g' \
-                -e 's/AKIA[0-9A-Z]\{16\}/[AWS_KEY_已脱敏]/g' \
-                "$log_file" 2>/dev/null || true
-              
-              # 大文件压缩
-              file_size=$(stat -f%z "$log_file" 2>/dev/null || stat -c%s "$log_file" 2>/dev/null || echo 0)
-              if [ "$file_size" -gt 1048576 ]; then
-                gzip "$log_file"
-                echo "  已压缩：运行${run_id}.log.gz（$((file_size/1024/1024))MB）"
+              # 压缩大文件
+              if [ $(stat -c%s "${logs_dir}/运行${run_id}.log" 2>/dev/null) -gt 1048576 ]; then
+                gzip "${logs_dir}/运行${run_id}.log"
               fi
             done
             
-            # 生成该工作流的中文摘要
-            summary_file="${ARCHIVE_DIR}/${wf_safe}-${wf_name_cn}-摘要.md"
-            cat > "$summary_file" << EOF
-          # ${wf_name_cn}（${wf_name_en}）- 运行摘要
+            # 生成摘要
+            cat > "${ARCHIVE_DIR}/${wf_safe}-摘要.md" << EOF
+          # ${wf_name} - 运行摘要
           
-          | 运行ID | 状态 | 结果 | 分支 | 触发事件 | 创建时间 | 链接 |
-          |--------|------|------|------|----------|----------|------|
+          | 运行ID | 状态 | 结果 | 分支 | 事件 | 时间 | 链接 |
+          |--------|------|------|------|------|------|------|
           EOF
-            jq -r '.[] | "|  $.databaseId) |  $.status) |  $.conclusion // "无") |  $.headBranch) |  $.event) |  $.createdAt) | [查看]( $.url)) |"' "$runs_file" >> "$summary_file"
-            
-            echo "" >> "$summary_file"
-            echo "## 统计信息" >> "$summary_file"
-            echo "- 总运行次数：${run_count}" >> "$summary_file"
-            echo "- 成功次数：$(jq '[.[] | select(.conclusion=="success")] | length' "$runs_file")" >> "$summary_file"
-            echo "- 失败次数：$(jq '[.[] | select(.conclusion=="failure")] | length' "$runs_file")" >> "$summary_file"
+            jq -r '.[] | "|  $.databaseId) |  $.status) |  $.conclusion // "无") |  $.headBranch) |  $.event) |  $.createdAt) | [查看]( $.url)) |"' "$runs_file" >> "${ARCHIVE_DIR}/${wf_safe}-摘要.md" 2>/dev/null
           done
 
-      - name: 生成主索引
-        run: |
-          DATE="2026-10-07"
-          ARCHIVE_DIR="归档/${DATE}"
-          
-          cat > "${ARCHIVE_DIR}/索引目录.md" << 'EOF'
-          # 📁 归档文件索引
-          
-          ## 文件结构说明
-          
-          ```
-          归档/
-          └── 2026-10-07/
-              ├── 总览说明.md              ← 先看这个，总体介绍
-              ├── 索引目录.md              ← 本文件，目录索引
-              ├── 工作流清单.json          ← 工作流原始数据
-              │
-              ├── Analyze_Tor_Structure-分析Tor结构-摘要.md
-              ├── Analyze_Tor_Structure-分析Tor结构-运行记录.json
-              ├── Analyze_Tor_Structure-分析Tor结构-原始日志/
-              │   ├── 运行3756xxxx.log[.gz]
-              │   └── ...
-              │
-              ├── Detect_Tor_Layer-检测Tor层级-摘要.md
-              ├── Detect_Tor_Layer-检测Tor层级-运行记录.json
-              ├── Detect_Tor_Layer-检测Tor层级-原始日志/
-              │   └── ...
-              │
-              └── Verify_Tor_Launch_Path-验证Tor启动路径-摘要.md
-                  ├── Verify_Tor_Launch_Path-验证Tor启动路径-运行记录.json
-                  └── Verify_Tor_Launch_Path-验证Tor启动路径-原始日志/
-                      └── ...
-          ```
-          
-          ## 快速导航
-          
-          | 工作流（中文） | 工作流（英文） | 摘要 | 日志 |
-          |--------------|--------------|------|------|
-          EOF
-          
-          # 添加导航链接
-          for summary in "${ARCHIVE_DIR}"/*-摘要.md; do
-            [ -f "$summary" ] || continue
-            base=$(basename "$summary" -摘要.md)
-            cn_name=$(echo "$base" | sed 's/.*-//')
-            en_name=$(echo "$base" | sed 's/-[^-]*$//' | sed 's/_/ /g')
-            echo "| ${cn_name} | ${en_name} | [摘要]($(basename "$summary")) | [日志文件夹](${base}-原始日志/) |" >> "${ARCHIVE_DIR}/索引目录.md"
-          done
-          
-          echo "" >> "${ARCHIVE_DIR}/索引目录.md"
-          echo "## 使用说明" >> "${ARCHIVE_DIR}/索引目录.md"
-          echo "1. 先看 **总览说明.md** 了解整体情况" >> "${ARCHIVE_DIR}/索引目录.md"
-          echo "2. 再查看各工作流的 **摘要.md** 了解每次运行状态" >> "${ARCHIVE_DIR}/索引目录.md"
-          echo "3. 需要详细分析时，进入 **原始日志/** 文件夹查看 .log 文件" >> "${ARCHIVE_DIR}/索引目录.md"
-          echo "4. .gz 文件为压缩日志，用 `zcat` 或解压工具打开" >> "${ARCHIVE_DIR}/索引目录.md"
-
-      - name: 提交到仓库
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add 归档/
-          git status
-          git commit -m "归档所有工作流历史日志（2026-10-07）[跳过CI]" || echo "无变更"
-          git push
+      - name: 打包上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 归档日志-${DATE}
+          path: 归档-${DATE}/
+          retention-days: 30
