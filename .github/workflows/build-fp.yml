@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - '.github/workflows/build-fp.yml'
+      - 'com/fp/tools/FakeSocksServer.java'
   workflow_dispatch:
 
 permissions:
@@ -19,9 +20,34 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq unzip zip wget xz-utils openjdk-17-jre-headless
+          sudo apt-get install -y -qq unzip zip wget xz-utils openjdk-17-jdk-headless
           wget -q -O apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
           wget -q -O uber-apk-signer.jar https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar
+          wget -q -O baksmali.jar https://github.com/JesusFreke/smali/releases/download/v2.5.2/baksmali-2.5.2.jar
+
+      - name: Setup ANDROID_HOME
+        run: |
+          if [ -z "$ANDROID_HOME" ]; then
+            if [ -d "/usr/local/lib/android/sdk" ]; then
+              echo "ANDROID_HOME=/usr/local/lib/android/sdk" >> $GITHUB_ENV
+            fi
+          fi
+          echo "SDK=$ANDROID_HOME"
+          ls "$ANDROID_HOME/build-tools" 2>/dev/null || echo "no build-tools"
+
+      - name: Compile FakeSocksServer.java to dex
+        run: |
+          mkdir -p classes
+          javac --release 8 -encoding UTF-8 -d classes com/fp/tools/FakeSocksServer.java
+          ls -la classes/com/fp/tools/
+          D8=$(find "$ANDROID_HOME/build-tools" -name d8 -type f | sort | tail -1)
+          echo "d8: $D8"
+          if [ -z "$D8" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;34.0.0"
+            D8=$(find "$ANDROID_HOME/build-tools" -name d8 -type f | sort | tail -1)
+          fi
+          "$D8" --min-api 21 --output . classes/com/fp/tools/*.class
+          ls -la classes.dex
 
       - name: Get APK
         env:
@@ -31,80 +57,39 @@ jobs:
           echo "VERSION=$V" >> $GITHUB_ENV
           gh release download "cache-${V}" --repo ${{ github.repository }} -p "tor-orig.apk" --clobber
 
-      - name: Decompile
+      - name: Decompile APK
         run: java -jar apktool.jar d tor-orig.apk -o decoded -f
 
-      - name: Search all proxy setting points
+      - name: Baksmali new dex into smali_classes4
         run: |
-          echo "########## 1. GeckoRuntimeSettings 里 proxy 相关 ##########"
-          f=$(find decoded/smali_classes* -name "GeckoRuntimeSettings.smali" | head -1)
-          echo "file: $f"
-          grep -nE "proxy|Proxy|9050|9150" "$f" | head -60
+          mkdir -p decoded/smali_classes4
+          java -jar baksmali.jar d classes.dex -o decoded/smali_classes4/
+          find decoded/smali_classes4 -name "*.smali"
 
-          echo ""
-          echo "########## 2. TorAndroidIntegration 里 proxy 相关 ##########"
-          f2=$(find decoded/smali_classes* -name "TorAndroidIntegration.smali" | head -1)
-          grep -nE "proxy|Proxy|9050|9150|setProxy|TorSettings" "$f2" | head -60
-
-          echo ""
-          echo "########## 3. 所有 smali 里含 const-string 且含 9050/9150 ##########"
-          grep -rn 'const-string.*"9050"\|const-string.*"9150"' decoded/smali_classes*/ 2>/dev/null | head -20
-
-          echo ""
-          echo "########## 4. 所有 smali 里含 setProxyHost/setProxyPort ##########"
-          grep -rln "setProxyHost\|setProxyPort\|proxyHost(" decoded/smali_classes*/ 2>/dev/null | head -20
-
-          echo ""
-          echo "########## 5. GeckoRuntime 里 proxy 相关 ##########"
-          f3=$(find decoded/smali_classes* -name "GeckoRuntime.smali" | head -1)
-          grep -nE "proxy|Proxy|9050|9150" "$f3" 2>/dev/null | head -40
-
-      - name: Aggressive patch GeckoRuntimeSettings proxy
+      - name: Inject FakeSocks start into HomeActivity
         run: |
-          f=$(find decoded/smali_classes* -name "GeckoRuntimeSettings.smali" | head -1)
-          if [ -z "$f" ]; then echo "GeckoRuntimeSettings not found, skip"; exit 0; fi
-          cp "$f" "$f.bak"
-
-          echo "===== 原始 proxy 相关方法 ====="
-          awk '/^\.method.*[Pp]roxy/,/^\.end method/' "$f" | head -200
-
-          echo ""
-          echo "===== 尝试把所有 proxy setter 改为空操作 ====="
-
-          # 找所有以 set...Proxy 或 setProxy 开头的方法，替换方法体为空
-          # 用 python 脚本（base64 传，避免 heredoc 破坏 YAML）
-          echo 'aW1wb3J0IHN5cywgcmUscGF0aCA9IHN5cy5hcmd2WzFdCcgfIGJhc2U2NCAtZCA+IC90bXAvcGF0Y2gucHk=
-' | head -1 > /dev/null
-
-          # 简化：直接 sed 删除 iget-object mProxyHost 那行
-          sed -i 's|iget-object v0, p0, Lorg/mozilla/geckoview/GeckoRuntimeSettings;->mProxyHost:Ljava/lang/String;|const/4 v0, 0x0|g' "$f"
-          sed -i 's|iget-object v1, p0, Lorg/mozilla/geckoview/GeckoRuntimeSettings;->mProxyHost:Ljava/lang/String;|const/4 v1, 0x0|g' "$f"
-          sed -i 's|iget v0, p0, Lorg/mozilla/geckoview/GeckoRuntimeSettings;->mProxyPort:I|const/4 v0, 0x0|g' "$f"
-          sed -i 's|iget v1, p0, Lorg/mozilla/geckoview/GeckoRuntimeSettings;->mProxyPort:I|const/4 v1, 0x0|g' "$f"
-          sed -i 's|iget-object v0, p0, Lorg/mozilla/geckoview/GeckoRuntimeSettings;->mProxyUsername:Ljava/lang/String;|const/4 v0, 0x0|g' "$f"
-          sed -i 's|iget-object v0, p0, Lorg/mozilla/geckoview/GeckoRuntimeSettings;->mProxyPassword:Ljava/lang/String;|const/4 v0, 0x0|g' "$f"
-
-          echo "===== DIFF ====="
-          diff "$f.bak" "$f" || echo "(no changes)"
-
-      - name: Aggressive patch TorSettings proxy fields
-        run: |
-          f=$(find decoded/smali_classes* -name "TorSettings.smali" | head -1)
-          cp "$f" "$f.bak"
-          # 前面已经改过 proxyEnabled，这里再把 proxyAddress 和 proxyPort 的赋值全部清零
-          sed -i 's|iput-object v1, p0, Lorg/mozilla/geckoview/TorSettings;->proxyAddress:Ljava/lang/String;|const/4 v1, 0x0\n    iput-object v1, p0, Lorg/mozilla/geckoview/TorSettings;->proxyAddress:Ljava/lang/String;|g' "$f"
-          sed -i 's|iput-object p1, p0, Lorg/mozilla/geckoview/TorSettings;->proxyAddress:Ljava/lang/String;|const/4 p1, 0x0\n    iput-object p1, p0, Lorg/mozilla/geckoview/TorSettings;->proxyAddress:Ljava/lang/String;|g' "$f"
-          sed -i 's|iput v1, p0, Lorg/mozilla/geckoview/TorSettings;->proxyPort:I|const/4 v1, 0x0\n    iput v1, p0, Lorg/mozilla/geckoview/TorSettings;->proxyPort:I|g' "$f"
-          sed -i 's|iput p1, p0, Lorg/mozilla/geckoview/TorSettings;->proxyPort:I|const/4 p1, 0x0\n    iput p1, p0, Lorg/mozilla/geckoview/TorSettings;->proxyPort:I|g' "$f"
-          echo "===== TorSettings DIFF ====="
-          diff "$f.bak" "$f" || echo "(no changes)"
+          f=decoded/smali_classes2/org/mozilla/fenix/HomeActivity.smali
+          awk '
+            BEGIN { done=0; is_onc=0 }
+            /^\.method public final onCreate\(Landroid\/os\/Bundle;\)V/ { is_onc=1; print; next }
+            is_onc && !done && /^[[:space:]]*\.locals/ {
+              print
+              print ""
+              print "    invoke-static {}, Lcom/fp/tools/FakeSocksServer;->start()V"
+              done=1; is_onc=0; next
+            }
+            { print }
+          ' "$f" > "$f.new"
+          mv "$f.new" "$f"
+          echo "=== 注入结果 ==="
+          grep -n -B 2 -A 2 "FakeSocksServer" "$f"
 
       - name: Patch nav_graph.xml
         run: |
           NAV=decoded/res/navigation/nav_graph.xml
           sed -i 's|org\.mozilla\.fenix\.tor\.TorConnectionAssistFragment|org.mozilla.fenix.home.HomeFragment|g' "$NAV"
 
-      - name: Patch omni.ja prefs
+      - name: Patch omni.ja prefs - keep proxy pointing to localhost
         run: |
           mkdir -p staging && cd staging
           unzip -o ../tor-orig.apk assets/omni.ja.xz assets/omni.ja.sha256
@@ -114,17 +99,10 @@ jobs:
           unzip -q ../omni.ja
           mkdir -p defaults/pref
           cat > defaults/pref/zzz-fp.js <<'PREFEOF'
-          pref("network.proxy.type", 0);
-          pref("network.proxy.socks", "");
-          pref("network.proxy.socks_port", 0);
-          pref("network.proxy.socks_remote_dns", false);
-          pref("network.proxy.share_proxy_settings", false);
-          pref("network.proxy.http", "");
-          pref("network.proxy.http_port", 0);
-          pref("network.proxy.ssl", "");
-          pref("network.proxy.ssl_port", 0);
-          pref("network.proxy.no_proxies_on", "");
-          pref("extensions.torlauncher.start_tor", false);
+          pref("network.proxy.type", 1);
+          pref("network.proxy.socks", "127.0.0.1");
+          pref("network.proxy.socks_port", 9050);
+          pref("network.proxy.socks_remote_dns", true);
           PREFEOF
           zip -q -r -0 ../omni-new.ja ./*
           cd ..
@@ -133,7 +111,7 @@ jobs:
           echo "$NEW_SHA" > assets/omni.ja.sha256
           cp omni-new.ja.xz assets/omni.ja.xz
 
-      - name: Repack with aapt2
+      - name: Repack APK
         run: |
           java -jar apktool.jar b decoded -o tor-patched.apk --use-aapt2
           cd staging
@@ -145,7 +123,7 @@ jobs:
       - name: Sign APK
         run: |
           TS=$(date +%Y%m%d-%H%M)
-          NEW="FingerprintLess-${VERSION}-arm64-去代理v3-${TS}-unsigned.apk"
+          NEW="FingerprintLess-${VERSION}-arm64-假代理-${TS}-unsigned.apk"
           mv tor-patched.apk "$NEW"
           java -jar uber-apk-signer.jar --apks "$NEW" -o signed --allowResign
           cd signed
@@ -160,10 +138,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TS=$(date +%Y%m%d-%H%M)
-          TAG="v${VERSION}-fp-noproxy3-${TS}"
+          TAG="v${VERSION}-fp-fakesocks-${TS}"
           gh release create "$TAG" \
             --repo ${{ github.repository }} \
-            --title "FP ${VERSION} 去代理v3 ${TS}" \
-            --notes "Aggressive proxy removal: GeckoRuntimeSettings + TorSettings + prefs." \
+            --title "FP ${VERSION} 假代理版 ${TS}" \
+            --notes "Embedded SOCKS5 on 127.0.0.1:9050, direct connection." \
             signed/*.apk
           echo "Release: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
