@@ -36,7 +36,6 @@ jobs:
           if [ -z "$V" ]; then V="16.0a13"; fi
           echo "VERSION=$V" >> $GITHUB_ENV
           gh release download "cache-${V}" --repo ${{ github.repository }} -p "tor-orig.apk" --clobber
-          ls -lh tor-orig.apk
 
       - name: Decompile
         run: java -jar apktool.jar d tor-orig.apk -o decoded -f
@@ -44,14 +43,46 @@ jobs:
       - name: Patch nav_graph.xml
         run: |
           NAV=decoded/res/navigation/nav_graph.xml
-          echo "Before:"
-          grep -c 'TorConnectionAssistFragment' "$NAV" || true
           sed -i 's|org\.mozilla\.fenix\.tor\.TorConnectionAssistFragment|org.mozilla.fenix.home.HomeFragment|g' "$NAV"
-          echo "After:"
-          grep -c 'TorConnectionAssistFragment' "$NAV" || true
-          grep -c 'org\.mozilla\.fenix\.home\.HomeFragment' "$NAV" || true
 
-      - name: Patch omni.ja
+      - name: Dump proxy code for diagnosis
+        run: |
+          echo "########## TorSettings.smali proxy 相关 ##########"
+          grep -nE "proxy|Proxy|9050|9150|127\.0\.0\.1|setSocks|socks" \
+            decoded/smali_classes3/org/mozilla/geckoview/TorSettings.smali 2>/dev/null | head -60
+
+          echo ""
+          echo "########## GeckoAppShell.smali proxy 相关 ##########"
+          grep -nE "setProxy|proxyHost|proxyPort|9050|9150|127\.0\.0\.1|socks|Socks" \
+            decoded/smali_classes2/org/mozilla/gecko/GeckoAppShell.smali 2>/dev/null | head -40
+
+          echo ""
+          echo "########## 其他含 9050 的文件 ##########"
+          grep -rln "9050\|9150" decoded/smali_classes*/ 2>/dev/null
+
+      - name: Patch proxy strings
+        run: |
+          for f in decoded/smali_classes3/org/mozilla/geckoview/TorSettings.smali \
+                   decoded/smali_classes2/org/mozilla/gecko/GeckoAppShell.smali; do
+            [ -f "$f" ] || continue
+            echo "=========== Patching: $f ==========="
+            cp "$f" "$f.bak"
+            sed -i 's|"127\.0\.0\.1:9050"|""|g' "$f"
+            sed -i 's|"127\.0\.0\.1:9150"|""|g' "$f"
+            sed -i 's|"127\.0\.0\.1"|""|g' "$f"
+            sed -i 's|"localhost"|""|g' "$f"
+            sed -i 's|"9050"|""|g' "$f"
+            sed -i 's|"9150"|""|g' "$f"
+            sed -i 's|0x235a|0x0|g' "$f"
+            sed -i 's|0x235A|0x0|g' "$f"
+            sed -i 's|0x23be|0x0|g' "$f"
+            sed -i 's|0x23BE|0x0|g' "$f"
+            echo "=== DIFF (before vs after) ==="
+            diff "$f.bak" "$f" || true
+            echo ""
+          done
+
+      - name: Patch omni.ja prefs
         run: |
           mkdir -p staging && cd staging
           unzip -o ../tor-orig.apk assets/omni.ja.xz assets/omni.ja.sha256
@@ -65,6 +96,7 @@ jobs:
           pref("network.proxy.socks", "");
           pref("network.proxy.socks_port", 0);
           pref("network.proxy.socks_remote_dns", false);
+          pref("network.proxy.socks_version", 0);
           pref("extensions.torlauncher.start_tor", false);
           pref("extensions.torlauncher.quickstart", false);
           pref("extensions.torlauncher.prompt_at_startup", false);
@@ -89,7 +121,7 @@ jobs:
       - name: Sign APK
         run: |
           TS=$(date +%Y%m%d-%H%M)
-          NEW="FP-${VERSION}-navswap-${TS}-unsigned.apk"
+          NEW="FingerprintLess-${VERSION}-arm64-去Tor网络去代理-${TS}-unsigned.apk"
           mv tor-patched.apk "$NEW"
           java -jar uber-apk-signer.jar --apks "$NEW" -o signed --allowResign
           cd signed
@@ -104,10 +136,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TS=$(date +%Y%m%d-%H%M)
-          TAG="v${VERSION}-fp-navswap-${TS}"
+          TAG="v${VERSION}-fp-noproxy-${TS}"
           gh release create "$TAG" \
             --repo ${{ github.repository }} \
-            --title "FP ${VERSION} navswap ${TS}" \
-            --notes "Tor network removed + TorConnectionAssistFragment class swapped to HomeFragment" \
+            --title "FP ${VERSION} 去Tor网络+去代理 ${TS}" \
+            --notes "Tor network removed + Tor proxy disabled + Tor onboarding bypassed." \
             signed/*.apk
           echo "Release: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
