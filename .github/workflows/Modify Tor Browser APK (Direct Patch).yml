@@ -1,0 +1,57 @@
+name: Modify Tor Browser APK (Direct Patch)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Tor Browser APK
+        run: |
+          # 从官方或镜像下载，约60-80MB
+          wget -O tor.apk "https://your-mirror/tor-browser.apk"
+
+      - name: Setup minimal tools
+        run: |
+          sudo apt-get install -y --no-install-recommends unzip zip openjdk-17-jre-headless
+          wget -O apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+          wget -O uber-apk-signer.jar https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar
+
+      - name: Unpack APK with apktool
+        run: java -jar apktool.jar d tor.apk -o tor_out -s  # -s 跳过dex反编译，更快更小
+
+      - name: Patch omni.ja preferences
+        run: |
+          cd tor_out/assets
+          mkdir omni_extract && cd omni_extract
+          unzip -o ../omni.ja
+          
+          # 找到包含 torlauncher.start_tor 的pref文件
+          PREF_FILE=$(grep -rl "torlauncher.start_tor" defaults/ 2>/dev/null | head -1)
+          echo "Patching: $PREF_FILE"
+          
+          # 改两个值
+          sed -i 's/extensions\.torlauncher\.start_tor.*true/extensions.torlauncher.start_tor", false/' "$PREF_FILE"
+          sed -i 's/network\.proxy\.type.*1/network.proxy.type", 0/' "$PREF_FILE"
+          
+          # 如果pref文件里没有network.proxy.type，追加
+          grep -q "network.proxy.type" "$PREF_FILE" || echo 'pref("network.proxy.type", 0);' >> "$PREF_FILE"
+          
+          # 重新打包omni.ja（保持zip格式，不压缩某些文件）
+          zip -r -0 ../omni_new.ja ./*
+          mv ../omni_new.ja ../omni.ja
+
+      - name: Repack APK
+        run: java -jar apktool.jar b tor_out -o tor_modified_unsigned.apk
+
+      - name: Sign APK
+        run: |
+          java -jar uber-apk-signer.jar --apks tor_modified_unsigned.apk
+          # 产物：tor_modified_unsigned-aligned-signed.apk
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: FingerprintLessBrowser
+          path: tor_modified_unsigned-aligned-signed.apk
