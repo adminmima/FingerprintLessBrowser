@@ -1,4 +1,4 @@
-name: Patch Tor Browser APK
+name: PatchAPK | 修改Tor浏览器APK去Tor网络
 
 on:
   workflow_dispatch:
@@ -24,18 +24,14 @@ jobs:
           wget -q -O apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
           wget -q -O uber-apk-signer.jar https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar
 
-      - name: Get APK from cache release
+      - name: Get APK from cache
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           V="${{ inputs.tor_version }}"
-          gh release download "cache-${V}" \
-            --repo ${{ github.repository }} \
-            -p "tor-orig.apk" \
-            --clobber
+          gh release download "cache-${V}" --repo ${{ github.repository }} -p "tor-orig.apk" --clobber
           ls -lh tor-orig.apk
 
-      # ============ Patch 1: omni.ja prefs ============
       - name: Patch omni.ja prefs
         run: |
           mkdir -p staging && cd staging
@@ -62,30 +58,24 @@ jobs:
           echo "$NEW_SHA" > assets/omni.ja.sha256
           cp omni-new.ja.xz assets/omni.ja.xz
 
-      # ============ Patch 2: nav_graph.xml 改起点 ============
       - name: Decompile APK
-        run: |
-          java -jar apktool.jar d tor-orig.apk -o decoded -f
+        run: java -jar apktool.jar d tor-orig.apk -o decoded -f
 
       - name: Patch nav_graph.xml startDestination
         run: |
           NAV=decoded/res/navigation/nav_graph.xml
           echo "=== Before ==="
           grep -oE 'app:startDestination="[^"]*"' "$NAV" | head -1
-          
-          # 把顶层 navigation 标签的 startDestination 改为 homeFragment
-          # 只替换第一处（顶层 navigation 标签里的）
           perl -0pi -e 's/(<navigation[^>]*?startDestination=")[^"]*(")/${1}\@id\/homeFragment${2}/' "$NAV"
-          
           echo "=== After ==="
           grep -oE 'app:startDestination="[^"]*"' "$NAV" | head -1
 
-      - name: Repack APK
+      - name: Repack APK with aapt2
         run: |
-          java -jar apktool.jar b decoded -o tor-patched-unsigned.apk
+          # 关键：--use-aapt2 让资源重建生效
+          java -jar apktool.jar b decoded -o tor-patched-unsigned.apk --use-aapt2
           ls -lh tor-patched-unsigned.apk
 
-      # ============ 合并 Patch 1 到新 APK ============
       - name: Apply omni.ja changes
         run: |
           cd staging
@@ -95,21 +85,48 @@ jobs:
           cd ..
           ls -lh tor-patched.apk
 
+      - name: Rename before sign
+        run: |
+          V="${{ inputs.tor_version }}"
+          TS=$(TZ='Asia/Shanghai' date +%Y%m%d-%H%M)
+          NEW="FingerprintLess-${V}-arm64-去Tor网络-跳过引导页-${TS}-unsigned.apk"
+          mv tor-patched.apk "$NEW"
+          echo "NEW_NAME=$NEW" >> $GITHUB_ENV
+          ls -lh FingerprintLess-*.apk
+
       - name: Sign APK
         run: |
-          java -jar uber-apk-signer.jar --apks tor-patched.apk -o signed --allowResign
-          ls -lh signed/
+          java -jar uber-apk-signer.jar --apks "$NEW_NAME" -o signed --allowResign
+          cd signed
+          for f in *-aligned-debugSigned.apk; do
+            [ -e "$f" ] || continue
+            mv "$f" "$(echo "$f" | sed 's/-aligned-debugSigned\.apk$/.apk/')"
+          done
+          for f in *-aligned-debugSigned.apk.idsig; do
+            [ -e "$f" ] || continue
+            mv "$f" "$(echo "$f" | sed 's/-aligned-debugSigned\.apk\.idsig$/.apk.idsig/')"
+          done
+          ls -lh
 
       - name: Create Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           V="${{ inputs.tor_version }}"
-          TAG="v${V}-fingerprintless"
+          TS=$(TZ='Asia/Shanghai' date +%Y%m%d-%H%M)
+          TAG="v${V}-fingerprintless-${TS}"
           gh release create "$TAG" \
             --repo ${{ github.repository }} \
-            --title "FingerprintLess ${V}" \
-            --notes "基于 Tor Browser ${V}。已移除 Tor 网络，直连互联网，完整保留反指纹保护。App 启动直接进主页，跳过 Tor 引导。" \
+            --title "FingerprintLess ${V} arm64 | 去Tor网络+跳过引导页 | ${TS}" \
+            --notes "**本次改动**：
+          - 移除 Tor 网络（network.proxy.type=0，直连互联网）
+          - 跳过 Tor 引导页（nav_graph startDestination → homeFragment）
+          - 完整保留反指纹保护（Canvas/WebGL/时区/字体/窗口尺寸）
+
+          **构建时间**：$(date -u '+%Y-%m-%d %H:%M UTC')
+          **基于版本**：Tor Browser ${V}（alpha）
+          **CPU 架构**：arm64-v8a
+          **构建方式**：apktool --use-aapt2 + uber-apk-signer" \
             signed/*.apk \
             || gh release upload "$TAG" signed/*.apk --clobber --repo ${{ github.repository }}
           echo "Release: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
