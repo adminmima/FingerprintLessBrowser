@@ -1,0 +1,34 @@
+name: Cache Tor APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      tor_version:
+        required: true
+        default: '16.0a13'
+
+permissions:
+  contents: write
+
+jobs:
+  cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and upload to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V="${{ inputs.tor_version }}"
+          wget -q -O tor-orig.apk "https://dist.torproject.org/torbrowser/${V}/tor-browser-android-aarch64-${V}.apk"
+          ls -lh tor-orig.apk
+          TAG="cache-${V}"
+          gh release create "$TAG" \
+            --repo ${{ github.repository }} \
+            --title "Cache: Tor Browser ${V} original APK" \
+            --notes "原始 APK 缓存，供 patch workflow 使用，不对外发布。" \
+            tor-orig.apk \
+            || gh release upload "$TAG" tor-orig.apk --clobber --repo ${{ github.repository }}
+          echo "Cached: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
