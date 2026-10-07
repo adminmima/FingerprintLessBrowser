@@ -1,0 +1,54 @@
+name: DumpStartup | 导出StartupFragment分析跳转逻辑
+
+on:
+  workflow_dispatch:
+    inputs:
+      tor_version:
+        required: true
+        default: '16.0a13'
+
+permissions:
+  contents: read
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip wget openjdk-17-jre-headless
+          wget -q -O apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+
+      - name: Get cached APK
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V="${{ inputs.tor_version }}"
+          gh release download "cache-${V}" \
+            --repo ${{ github.repository }} \
+            -p "tor-orig.apk" \
+            --clobber
+
+      - name: Decompile
+        run: java -jar apktool.jar d tor-orig.apk -o out -f
+
+      - name: Dump StartupFragment
+        run: |
+          echo "########## StartupFragment.smali ##########"
+          find out/smali_classes* -name "StartupFragment.smali" -exec cat {} \;
+
+          echo ""
+          echo "########## StartupFragment 里的 navigate 调用 ##########"
+          find out/smali_classes* -name "StartupFragment.smali" -exec grep -nE "navigate|NavController|NavDirections|ActionHome|torConnectionAssist|TorConnectionAssist|homeFragment" {} \;
+
+          echo ""
+          echo "########## StartupFragment 调用的方法名 ##########"
+          find out/smali_classes* -name "StartupFragment.smali" -exec grep -E "invoke-.*->" {} \; | sed 's/.*->//' | sort -u
+
+          echo ""
+          echo "########## 所有 StartupFragment* 文件 ##########"
+          find out/smali_classes* -name "StartupFragment*" -type f
