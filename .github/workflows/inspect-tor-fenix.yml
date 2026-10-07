@@ -1,0 +1,75 @@
+name: Inspect Fenix Tor Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      tor_version:
+        required: true
+        default: '16.0a13'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip wget openjdk-17-jre-headless
+          wget -q -O apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+
+      - name: Download APK
+        run: |
+          V="${{ inputs.tor_version }}"
+          wget -q -O tor.apk "https://dist.torproject.org/torbrowser/${V}/tor-browser-android-aarch64-${V}.apk"
+
+      - name: Decompile
+        run: java -jar apktool.jar d tor.apk -o out -f
+
+      - name: List org/mozilla/fenix/tor dir
+        run: |
+          echo "========== fenix/tor 目录文件 =========="
+          find out/smali_classes2/org/mozilla/fenix/tor -type f 2>/dev/null
+
+          echo ""
+          echo "========== fenix/tor 所有 .smali（含子目录） =========="
+          find out/smali_classes* -type d -path "*fenix/tor*" 2>/dev/null
+
+          echo ""
+          echo "========== 谁在调用 TorConnectionAssistFragment =========="
+          grep -rln "TorConnectionAssistFragment" out/smali_classes* 2>/dev/null
+
+          echo ""
+          echo "========== ConnectAssistUiState 内容 =========="
+          cat out/smali_classes2/org/mozilla/fenix/tor/ConnectAssistUiState.smali 2>/dev/null | head -100
+
+          echo ""
+          echo "========== 谁在调用 ConnectAssistUiState =========="
+          grep -rln "ConnectAssistUiState" out/smali_classes* 2>/dev/null
+
+      - name: Dump TorConnectionAssistFragment
+        run: |
+          echo "========== TorConnectionAssistFragment.smali =========="
+          cat out/smali_classes2/org/mozilla/fenix/tor/TorConnectionAssistFragment.smali 2>/dev/null
+
+      - name: Grep for connection stage checks
+        run: |
+          echo "========== 含 ConnectionStage / TorConnectStage 的文件 =========="
+          grep -rln "ConnectionStage\|TorConnectStage\|Onboarding\|onboarding" out/smali_classes* 2>/dev/null | head -30
+
+          echo ""
+          echo "========== 含 bootstrap / Bootstrap 的文件 =========="
+          grep -rln "bootstrap\|Bootstrap" out/smali_classes* 2>/dev/null | grep -iv "Detector\|Iterator" | head -30
+
+      - name: Upload fenix/tor smali
+        uses: actions/upload-artifact@v4
+        with:
+          name: fenix-tor-smali
+          path: |
+            out/smali_classes2/org/mozilla/fenix/tor/
+          retention-days: 7
