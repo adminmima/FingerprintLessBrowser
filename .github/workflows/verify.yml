@@ -1,0 +1,86 @@
+name: Verify Tor Launch Path
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip default-jre binutils apktool
+      
+      - name: Download and decompile APK
+        run: |
+          curl -Lf -A "Mozilla/5.0" --max-time 60 \
+            "https://dist.torproject.org/torbrowser/13.5.6/tor-browser-android-aarch64-13.5.6.apk" \
+            -o torbrowser.apk || \
+          curl -Lf -A "Mozilla/5.0" --max-time 60 \
+            "https://archive.torproject.org/tor-package-archive/torbrowser/13.5.6/tor-browser-android-aarch64-13.5.6.apk" \
+            -o torbrowser.apk
+          apktool d torbrowser.apk -o tor_out
+      
+      - name: Check 1: JNI native methods
+        run: |
+          echo "=== JNI native methods in Java ==="
+          grep -ri "native.*tor\|native.*bootstrap\|native.*circuit" tor_out/smali/ 2>/dev/null | head -20
+          echo "Count: $(grep -ric 'native.*tor\|native.*bootstrap\|native.*circuit' tor_out/smali/ 2>/dev/null || echo 0)"
+      
+      - name: Check 2: libTor referenced by name
+        run: |
+          echo "=== libTor string references ==="
+          grep -ri "libTor\|libtor\|\"Tor\"\|\"tor\"" tor_out/smali/ 2>/dev/null | head -20
+          echo "Count: $(grep -ric 'libTor\|libtor\|\"Tor\"\|\"tor\"' tor_out/smali/ 2>/dev/null || echo 0)"
+      
+      - name: Check 3: Orbot references
+        run: |
+          echo "=== Orbot references ==="
+          grep -ri "orbot\|Orbot" tor_out/smali/ 2>/dev/null | head -20
+          echo "Count: $(grep -ric 'orbot\|Orbot' tor_out/smali/ 2>/dev/null || echo 0)"
+      
+      - name: Check 4: AndroidManifest services
+        run: |
+          echo "=== Services in manifest ==="
+          grep -i "service" tor_out/AndroidManifest.xml | head -20
+      
+      - name: Check 5: Process execution
+        run: |
+          echo "=== ProcessBuilder / Runtime.exec ==="
+          grep -ri "ProcessBuilder\|Runtime.*exec\|exec(" tor_out/smali/ 2>/dev/null | head -20
+          echo "Count: $(grep -ric 'ProcessBuilder\|Runtime.*exec' tor_out/smali/ 2>/dev/null || echo 0)"
+      
+      - name: Check 6: LocalSocket / Unix domain socket
+        run: |
+          echo "=== LocalSocket / UnixSocket ==="
+          grep -ri "LocalSocket\|UnixSocket\|LocalServerSocket" tor_out/smali/ 2>/dev/null | head -20
+          echo "Count: $(grep -ric 'LocalSocket\|UnixSocket\|LocalServerSocket' tor_out/smali/ 2>/dev/null || echo 0)"
+      
+      - name: Check 7: libxul.so Tor strings
+        run: |
+          echo "=== libxul.so Tor-related strings (sample) ==="
+          strings tor_out/lib/arm64-v8a/libxul.so | grep -i "tor\|bootstrap\|circuit\|onion" | head -30
+          echo "Total Tor strings in libxul.so: $(strings tor_out/lib/arm64-v8a/libxul.so 2>/dev/null | grep -ic 'tor\|bootstrap\|circuit\|onion' || echo 0)"
+      
+      - name: Check 8: TorLauncher / torbutton
+        run: |
+          echo "=== TorLauncher / torbutton ==="
+          grep -ri "TorLauncher\|torbutton\|tor-launcher" tor_out/ 2>/dev/null | head -20
+          echo "Count: $(grep -ric 'TorLauncher\|torbutton\|tor-launcher' tor_out/ 2>/dev/null || echo 0)"
+      
+      - name: Check 9: Proxy configuration in smali
+        run: |
+          echo "=== Proxy type / SOCKS direct ==="
+          grep -ri "PROXY_TYPE\|SOCKS\|socksProxy\|network.proxy" tor_out/smali/ 2>/dev/null | head -20
+          echo "Count: $(grep -ric 'PROXY_TYPE\|SOCKS\|socksProxy\|network.proxy' tor_out/smali/ 2>/dev/null || echo 0)"
+      
+      - name: Summary
+        run: |
+          echo ""
+          echo "==== VERIFICATION SUMMARY ===="
+          echo "If ALL Java layer checks show 0 or minimal results,"
+          echo "but libxul.so has many Tor strings,"
+          echo "then Tor launch is CONFIRMED to be in Gecko/SO layer."
