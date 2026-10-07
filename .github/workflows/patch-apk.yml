@@ -1,4 +1,4 @@
-name: PatchAPK | 修改Tor浏览器APK去Tor网络
+name: PatchAPK | 修改Tor浏览器APK去Tor网络（三变体）
 
 on:
   workflow_dispatch:
@@ -12,10 +12,31 @@ permissions:
 
 jobs:
   patch:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [navswap, aggressive, full]
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+
+      - name: Variant info
+        run: |
+          case "${{ matrix.variant }}" in
+            navswap)
+              echo "V_CN=换类名" >> $GITHUB_ENV
+              echo "V_DESC=把Tor引导页Fragment的类名替换为HomeFragment（银弹）" >> $GITHUB_ENV
+              ;;
+            aggressive)
+              echo "V_CN=激进换类名改起点" >> $GITHUB_ENV
+              echo "V_DESC=换类名 + startDestination改为homeFragment" >> $GITHUB_ENV
+              ;;
+            full)
+              echo "V_CN=全部组合" >> $GITHUB_ENV
+              echo "V_DESC=换类名 + 改起点 + smali跳转表修复" >> $GITHUB_ENV
+              ;;
+          esac
 
       - name: Install tools
         run: |
@@ -30,7 +51,6 @@ jobs:
         run: |
           V="${{ inputs.tor_version }}"
           gh release download "cache-${V}" --repo ${{ github.repository }} -p "tor-orig.apk" --clobber
-          ls -lh tor-orig.apk
 
       - name: Patch omni.ja prefs
         run: |
@@ -61,18 +81,66 @@ jobs:
       - name: Decompile APK
         run: java -jar apktool.jar d tor-orig.apk -o decoded -f
 
-      - name: Patch nav_graph.xml startDestination
+      - name: Patch nav_graph.xml
         run: |
           NAV=decoded/res/navigation/nav_graph.xml
-          echo "=== Before ==="
+          echo "=== Before: torConnectionAssistFragment 声明 ==="
+          grep -o 'org\.mozilla\.fenix\.tor\.TorConnectionAssistFragment' "$NAV" | head -3
+          echo "=== Before: startDestination ==="
           grep -oE 'app:startDestination="[^"]*"' "$NAV" | head -1
-          perl -0pi -e 's/(<navigation[^>]*?startDestination=")[^"]*(")/${1}\@id\/homeFragment${2}/' "$NAV"
-          echo "=== After ==="
+
+          # 银弹：全局把 TorConnectionAssistFragment 的类名替换为 HomeFragment
+          # 保持 id 不变，让 HomeActivity 的 navigate 照常工作，但加载的是 HomeFragment
+          sed -i 's|org\.mozilla\.fenix\.tor\.TorConnectionAssistFragment|org.mozilla.fenix.home.HomeFragment|g' "$NAV"
+
+          # 变体 2/3：改 startDestination
+          if [ "${{ matrix.variant }}" != "navswap" ]; then
+            perl -0pi -e 's/(<navigation[^>]*?startDestination=")[^"]*(")/${1}\@id\/homeFragment${2}/' "$NAV"
+          fi
+
+          echo "=== After: Tor 引导页 class 引用（应为 0） ==="
+          grep -c 'TorConnectionAssistFragment' "$NAV" || echo 0
+          echo "=== After: HomeFragment class 引用数 ==="
+          grep -c 'org\.mozilla\.fenix\.home\.HomeFragment' "$NAV"
+          echo "=== After: startDestination ==="
           grep -oE 'app:startDestination="[^"]*"' "$NAV" | head -1
+
+      - name: Patch smali (only for full variant)
+        if: matrix.variant == 'full'
+        run: |
+          TARGET="decoded/smali_classes2/org/mozilla/fenix/tor/TorConnectionAssistViewModel\$collectTorConnectStage\$2.smali"
+          if [ -f "$TARGET" ]; then
+            echo "=== Before ==="
+            grep -A 14 ":pswitch_data_0" "$TARGET"
+            # 用 python 精确替换 packed-switch 段内的第一个 :pswitch_6 为 :pswitch_1
+            python3 - "$TARGET" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    lines = f.readlines()
+in_switch = False
+done = False
+for i, line in enumerate(lines):
+    if '.packed-switch' in line:
+        in_switch = True
+        continue
+    if '.end packed-switch' in line:
+        in_switch = False
+        continue
+    if in_switch and not done and line.strip().startswith(':pswitch_6'):
+        indent = line[:len(line) - len(line.lstrip())]
+        lines[i] = indent + ':pswitch_1\n'
+        done = True
+with open(path, 'w') as f:
+    f.writelines(lines)
+print("pswitch_6 -> pswitch_1 done" if done else "NOT FOUND")
+PYEOF
+            echo "=== After ==="
+            grep -A 14 ":pswitch_data_0" "$TARGET"
+          fi
 
       - name: Repack APK with aapt2
         run: |
-          # 关键：--use-aapt2 让资源重建生效
           java -jar apktool.jar b decoded -o tor-patched-unsigned.apk --use-aapt2
           ls -lh tor-patched-unsigned.apk
 
@@ -83,16 +151,15 @@ jobs:
           zip -0 tor-patched.apk assets/omni.ja.xz assets/omni.ja.sha256
           mv tor-patched.apk ../
           cd ..
-          ls -lh tor-patched.apk
 
       - name: Rename before sign
         run: |
           V="${{ inputs.tor_version }}"
           TS=$(TZ='Asia/Shanghai' date +%Y%m%d-%H%M)
-          NEW="FingerprintLess-${V}-arm64-去Tor网络-跳过引导页-${TS}-unsigned.apk"
+          VN="${{ env.V_CN }}"
+          NEW="FingerprintLess-${V}-arm64-${VN}-${TS}-unsigned.apk"
           mv tor-patched.apk "$NEW"
           echo "NEW_NAME=$NEW" >> $GITHUB_ENV
-          ls -lh FingerprintLess-*.apk
 
       - name: Sign APK
         run: |
@@ -108,25 +175,38 @@ jobs:
           done
           ls -lh
 
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FingerprintLess-${{ matrix.variant }}-${{ inputs.tor_version }}
+          path: signed/*.apk
+
       - name: Create Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           V="${{ inputs.tor_version }}"
           TS=$(TZ='Asia/Shanghai' date +%Y%m%d-%H%M)
+          VN="${{ env.V_CN }}"
+          VD="${{ env.V_DESC }}"
           TAG="v${V}-fingerprintless-${TS}"
-          gh release create "$TAG" \
-            --repo ${{ github.repository }} \
-            --title "FingerprintLess ${V} arm64 | 去Tor网络+跳过引导页 | ${TS}" \
-            --notes "**本次改动**：
-          - 移除 Tor 网络（network.proxy.type=0，直连互联网）
-          - 跳过 Tor 引导页（nav_graph startDestination → homeFragment）
-          - 完整保留反指纹保护（Canvas/WebGL/时区/字体/窗口尺寸）
+          # 检查 release 是否已存在（matrix 中第一个 job 创建）
+          if gh release view "$TAG" --repo ${{ github.repository }} >/dev/null 2>&1; then
+            gh release upload "$TAG" signed/*.apk --clobber --repo ${{ github.repository }}
+          else
+            gh release create "$TAG" \
+              --repo ${{ github.repository }} \
+              --title "FingerprintLess ${V} arm64 | 三变体对照 | ${TS}" \
+              --notes "**本次三个变体对照（哪个能进主页用哪个）**：
+          - navswap（银弹）：Tor引导页类名替换为HomeFragment
+          - aggressive：银弹 + startDestination改为homeFragment
+          - full：银弹 + startDestination + smali跳转表修复
 
+          **共同改动**：移除 Tor 网络（network.proxy.type=0）
+          **保留**：完整反指纹保护（Canvas/WebGL/时区/字体/窗口尺寸）
           **构建时间**：$(date -u '+%Y-%m-%d %H:%M UTC')
           **基于版本**：Tor Browser ${V}（alpha）
-          **CPU 架构**：arm64-v8a
-          **构建方式**：apktool --use-aapt2 + uber-apk-signer" \
-            signed/*.apk \
-            || gh release upload "$TAG" signed/*.apk --clobber --repo ${{ github.repository }}
+          **CPU 架构**：arm64-v8a" \
+              signed/*.apk
+          fi
           echo "Release: https://github.com/${{ github.repository }}/releases/tag/${TAG}"
