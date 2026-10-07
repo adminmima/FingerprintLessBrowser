@@ -1,0 +1,60 @@
+name: Analyze Tor Structure
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip default-jre binutils apktool
+      
+      - name: Download Tor Browser APK
+        run: |
+          curl -Lf -A "Mozilla/5.0" --max-time 60 \
+            "https://dist.torproject.org/torbrowser/13.5.6/tor-browser-android-aarch64-13.5.6.apk" \
+            -o torbrowser.apk || \
+          curl -Lf -A "Mozilla/5.0" --max-time 60 \
+            "https://archive.torproject.org/tor-package-archive/torbrowser/13.5.6/tor-browser-android-aarch64-13.5.6.apk" \
+            -o torbrowser.apk
+          
+          ls -la torbrowser.apk
+      
+      - name: Decompile APK
+        run: apktool d torbrowser.apk -o tor_out
+      
+      - name: Analyze libTor.so exports
+        run: |
+          echo "=== libTor.so strings (first 100) ==="
+          strings tor_out/lib/arm64-v8a/libTor.so | head -100
+          
+          echo ""
+          echo "=== libTor.so size ==="
+          ls -la tor_out/lib/arm64-v8a/libTor.so
+      
+      - name: Find Java Tor load points
+        run: |
+          echo "=== System.loadLibrary Tor ==="
+          grep -ri "loadLibrary.*[Tt]or\|System.load" tor_out/smali/ | head -30
+          
+          echo ""
+          echo "=== TorService / startTor / initTor ==="
+          grep -ri "TorService\|startTor\|initTor" tor_out/smali/ | head -30
+      
+      - name: Find proxy settings
+        run: |
+          echo "=== SOCKS / 127.0.0.1 / 9050 / 9150 ==="
+          grep -ri "socks\|127.0.0.1\|:9050\|:9150" tor_out/smali/ | head -30
+      
+      - name: List all so files with tor strings count
+        run: |
+          echo "=== All SO files tor string counts ==="
+          for so in tor_out/lib/arm64-v8a/*.so; do
+            count=$(strings "$so" 2>/dev/null | grep -ic "tor\|orbot\|bootstrap\|onion\|circuit" || echo 0)
+            echo "$(basename $so): $count"
+          done
