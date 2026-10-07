@@ -1,0 +1,92 @@
+name: Detect Tor Layer
+
+on:
+  workflow_dispatch:
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip default-jre binutils apktool
+      
+      - name: Verify apktool
+        run: apktool --version
+      
+      - name: Download Tor Browser APK
+        run: |
+          for url in \
+            "https://dist.torproject.org/torbrowser/13.5.6/tor-browser-android-aarch64-13.5.6.apk" \
+            "https://archive.torproject.org/tor-package-archive/torbrowser/13.5.6/tor-browser-android-aarch64-13.5.6.apk"
+          do
+            echo "Trying: $url"
+            curl -Lf -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              --max-time 60 \
+              "$url" -o torbrowser.apk && \
+            ls -la torbrowser.apk && \
+            break || echo "Failed, trying next..."
+          done
+          
+          # 验证文件存在且非空
+          if [ ! -s torbrowser.apk ]; then
+            echo "APK empty or missing"
+            exit 1
+          fi
+          
+          # 验证是 APK（检查 ZIP 魔数 PK）
+          if ! head -c 2 torbrowser.apk | xxd | grep -q "504b"; then
+            echo "Not a valid ZIP/APK (no PK header)"
+            head -c 100 torbrowser.apk | xxd
+            exit 1
+          fi
+          
+          echo "APK validated:"
+          ls -la torbrowser.apk
+      
+      - name: Decompile APK
+        run: |
+          apktool d torbrowser.apk -o tor_out
+          ls -la tor_out/
+      
+      - name: Detect Java layer
+        run: |
+          echo "=== Tor-related classes ===" | tee detect_result.txt
+          find tor_out/smali -name "*.smali" -exec grep -li "tor\|orbot\|bootstrap\|onion\|circuit" {} + 2>/dev/null | tee -a detect_result.txt
+          
+          echo "" | tee -a detect_result.txt
+          echo "=== Class count ===" | tee -a detect_result.txt
+          find tor_out/smali -name "*.smali" | xargs grep -li "tor\|orbot\|bootstrap" 2>/dev/null | wc -l | tee -a detect_result.txt
+      
+      - name: Detect SO layer
+        run: |
+          echo "" | tee -a detect_result.txt
+          echo "=== SO files ===" | tee -a detect_result.txt
+          find tor_out/lib -name "*.so" | tee -a detect_result.txt
+          
+          echo "" | tee -a detect_result.txt
+          echo "=== Tor strings in SO ===" | tee -a detect_result.txt
+          for so in $(find tor_out/lib -name "*.so" | head -10); do
+            count=$(strings "$so" 2>/dev/null | grep -ic "tor\|orbot\|bootstrap\|onion\|circuit" || echo 0)
+            echo "$(basename $so): $count" | tee -a detect_result.txt
+          done
+      
+      - name: Detect proxy settings
+        run: |
+          echo "" | tee -a detect_result.txt
+          echo "=== Proxy references ===" | tee -a detect_result.txt
+          grep -ri "socks\|127.0.0.1\|:9050\|:9150\|proxy" tor_out/smali/ 2>/dev/null | head -30 | tee -a detect_result.txt
+      
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: detect-result
+          path: detect_result.txt
+      
+      - name: Print summary
+        run: |
+          echo "==== SUMMARY ===="
+          cat detect_result.txt
